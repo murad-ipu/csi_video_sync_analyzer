@@ -12,6 +12,7 @@ const state = {
   pinnedCsi: null,      // set by Shift+arrow so CSI stays put while the video seeks
   pendingFrame: null,   // target of a seek in progress, so quick arrow presses add up
   offsetS: 0, windowS: 10, normalized: true, renderQueued: false,
+  mode: "time",         // "time" or "frequency"; see frequency.js
 };
 let meta, frameT, framePts, csiT, csiRssi, ampRaw, ampNorm, chartT, chartMotion, chartRssi, chartX;
 let bins, K, motionPlot, rssiPlot;
@@ -230,6 +231,7 @@ function makeChart(element, values, range, hoverId, digits) {
 }
 
 function updateChartWindows() {
+  if (state.mode === "frequency") { updateBandWindow(); return; }
   const center = cursorTime();
   for (const plot of [motionPlot, rssiPlot]) plot.setScale("x", { min: center - state.windowS, max: center + state.windowS });
 }
@@ -238,6 +240,16 @@ function applyOffsetToCharts() {
   chartX = Float64Array.from(chartT, (t) => t + state.offsetS);
   motionPlot.setData([chartX, chartMotion], false);
   rssiPlot.setData([chartX, chartRssi], false);
+  applyFrequencyOffset();
+}
+
+// A hidden chart measures zero, so only the charts on screen can be resized.
+function resizeVisibleCharts() {
+  if (state.mode === "frequency") { resizeBandPlot(); return; }
+  for (const [plot, id] of [[motionPlot, "chartMotion"], [rssiPlot, "chartRssi"]]) {
+    const element = $(id);
+    plot.setSize({ width: element.clientWidth, height: element.clientHeight });
+  }
 }
 
 // --- Rendering --------------------------------------------------------------------
@@ -253,8 +265,12 @@ function updateInfo() {
 function render() {
   const started = performance.now();
   state.renderQueued = false;
-  drawWaterfall();
-  drawFrame();
+  if (state.mode === "frequency") {
+    drawFrequencyPanels();
+  } else {
+    drawWaterfall();
+    drawFrame();
+  }
   updateChartWindows();
   updateInfo();
   renderTimes.push(performance.now() - started);
@@ -387,10 +403,7 @@ function bindControls() {
   document.addEventListener("keyup", (event) => { if (event.key === " ") event.preventDefault(); }, true);
 
   new ResizeObserver(() => {
-    for (const [plot, id] of [[motionPlot, "chartMotion"], [rssiPlot, "chartRssi"]]) {
-      const element = $(id);
-      plot.setSize({ width: element.clientWidth, height: element.clientHeight });
-    }
+    resizeVisibleCharts();
     queueRender();
   }).observe($("right"));
 }
@@ -410,6 +423,7 @@ async function start() {
   rssiPlot = makeChart($("chartRssi"), chartRssi, meta.rssi_range, "hoverRssi", 0);
   bindControls();
   setOffset(meta.sync_offset_ms, false);
+  initFrequency();
 
   const fit = meta.summary.fit_ok ? `clock fit residual ${meta.summary.fit_residual_rms_ms.toFixed(2)} ms` : "clock fit unreliable";
   $("infoStatus").textContent = fit;

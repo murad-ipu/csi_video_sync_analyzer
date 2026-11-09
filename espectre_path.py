@@ -20,6 +20,9 @@ def setup(repo=None) -> Path:
             f"ESPectre repository not found at {root}.\n"
             "Pass --repo <path to espectre clone> or set ESPECTRE_REPO."
         )
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
+    # The root serves `tools.lib...` and `src.python...`; src/python serves
+    # `micro_espectre`, which ESPectre's CLI modules import as a top-level package.
+    for path in (str(root / "src" / "python"), str(root)):
+        if path not in sys.path:
+            sys.path.insert(0, path)
     return root

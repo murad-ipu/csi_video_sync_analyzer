@@ -37,11 +37,55 @@
         <div class="title"><span>RSSI (dBm)</span><output id="hoverRssi"></output></div>
         <div class="chart" id="chartRssi"></div>
       </div>
+
+      <div id="freqControls" hidden>
+        <label title="Longer windows separate nearby frequencies better but blur fast changes">Window
+          <select id="freqWindow">
+            <option value="0.5">0.5 s</option><option value="1">1 s</option><option value="2" selected>2 s</option><option value="5">5 s</option><option value="10">10 s</option><option value="20">20 s</option>
+          </select>
+        </label>
+        <label title="Time between one spectrum and the next">Hop
+          <select id="freqHop">
+            <option value="0.05">0.05 s</option><option value="0.1" selected>0.1 s</option><option value="0.2">0.2 s</option><option value="0.25">0.25 s</option><option value="0.5">0.5 s</option>
+          </select>
+        </label>
+        <label title="How the subcarriers are combined">Combine
+          <select id="freqMethod">
+            <option value="mean" selected>Mean</option><option value="pca1">PCA 1</option><option value="pca2">PCA 2</option>
+          </select>
+        </label>
+        <label>Range
+          <select id="freqRange">
+            <option value="2">0-2 Hz</option><option value="5">0-5 Hz</option><option value="20">0-20 Hz</option><option value="50" selected>0-50 Hz</option>
+          </select>
+        </label>
+        <label><input id="colorAuto" type="checkbox" checked> Auto color</label>
+        <label>Min <input id="colorMin" type="number" step="1" value="-60" aria-label="Lowest color in dB"></label>
+        <label>Max <input id="colorMax" type="number" step="1" value="0" aria-label="Highest color in dB"></label>
+        <output id="freqInfo"></output>
+        <output id="freqStatus" role="status"></output>
+      </div>
+      <div class="panel" id="panelSpectrogram" hidden>
+        <div class="title"><span>Spectrogram (frequency by time) · <span id="colorReadout"></span></span><output id="hoverSpectrogram"></output></div>
+        <canvas id="spectrogram"></canvas>
+      </div>
+      <div class="panel" id="panelSpectrum" hidden>
+        <div class="title"><span>Current spectrum, <span id="spectrumWhen"></span></span><output id="hoverSpectrum"></output></div>
+        <canvas id="spectrum"></canvas>
+      </div>
+      <div class="panel" id="panelBands" hidden>
+        <div class="title"><span>Band power (dB)</span><output id="hoverBands"></output></div>
+        <div class="legend" id="bandLegend"></div>
+        <div class="chart" id="chartBands"></div>
+      </div>
     </section>
   </main>
 
   <footer id="controls">
     <button id="play" title="Space">Play</button>
+    <div class="mode" role="group" aria-label="View">
+      <button id="modeTime" aria-pressed="true">Time</button><button id="modeFrequency" aria-pressed="false">Frequency</button>
+    </div>
     <input id="timeline" type="range" min="0" value="0" step="1" aria-label="Timeline">
     <label>Speed
       <select id="speed">
@@ -53,7 +97,7 @@
         <option value="2">±2 s</option><option value="5">±5 s</option><option value="10" selected>±10 s</option><option value="30">±30 s</option><option value="60">±60 s</option>
       </select>
     </label>
-    <label><input id="normalized" type="checkbox" checked> Normalize per frame</label>
+    <label id="normalizedLabel"><input id="normalized" type="checkbox" checked> Normalize per frame</label>
     <label class="sync">Sync offset
       <input id="offset" type="range" min="-500" max="500" step="1" value="0" aria-label="Sync offset in milliseconds">
       <output id="offsetValue">0 ms</output>
@@ -63,6 +107,7 @@
   </footer>
 
   <script src="vendor/uPlot.iife.min.js"></script>
+  <script src="frequency.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
