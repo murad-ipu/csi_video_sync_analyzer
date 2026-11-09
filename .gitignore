@@ -1,0 +1,156 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+bin/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit testing / coverage reports
+htmlcov/
+.toml/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.modman/
+.pytest_cache/
+.pytest-cache/
+.pytest_cache_custom/
+.pytest-cache-custom/
+pytestdebug.log
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+#   For a library or package, you might want to comit it.
+#   For an application, you might want to ignore it.
+#.python-version
+
+# pipenv
+#   According to pypa/pipenv#1173, pipenv managed virtual environments are placed in
+#   ~/.local/share/virtualenvs by default. But if you have PIPENV_VENV_IN_PROJECT=1
+#   set, they will be created in the project directory as .venv.
+#   For a library/package, you should check Pipfile.lock into source control.
+#   For an application, you should check Pipfile.lock into source control.
+#Pipfile.lock
+
+# poetry
+#   Similar to pipenv, poetry managed virtual environments can be in project
+#Poetry.lock
+
+# pdm
+#   PDM stores project-wide configurations in .pdm.toml
+.pdm.toml
+#   PDM can optionally create a virtualenv named .venv in the project root
+.venv/
+
+# venv
+#   The standard Python virtual environment tool
+.venv/
+venv/
+ENV/
+env/
+
+# Graphs and logs
+*.png
+*.jpg
+*.jpeg
+*.log
+
+# Environments and secrets
+.env
+.env.*
+.venv
+env/
+venv/
+ENV/
+env.bak
+venv.bak
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Ruff
+.ruff_cache/
+
+# linter / formatter tools
+.pylintcommon
+.pylintrc
+.pylintrc_custom
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+.DS_Store

@@ -1,0 +1,9 @@
+numpy>=2.0
+opencv-python>=4.10
+av>=14.0
+fastapi>=0.115
+uvicorn>=0.30
+requests>=2.31
+# Tests only
+pytest>=8.0
+httpx>=0.27

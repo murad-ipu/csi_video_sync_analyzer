@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CSI Video Player</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="vendor/uPlot.min.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header id="info" aria-live="off">
+    <span><b>Video</b> <output id="infoVideo">--</output></span>
+    <span><b>CSI</b> <output id="infoCsi">--</output></span>
+    <span><b>Difference</b> <output id="infoDelta">--</output></span>
+    <span><b>RSSI</b> <output id="infoRssi">--</output></span>
+    <span id="infoStatus"></span>
+  </header>
+
+  <main>
+    <section id="left">
+      <video id="video" src="video.mp4" muted playsinline preload="auto"></video>
+    </section>
+
+    <section id="right">
+      <div class="panel" id="panelWaterfall">
+        <div class="title"><span>Amplitude waterfall (subcarrier by time)</span><output id="hoverWaterfall"></output></div>
+        <canvas id="waterfall"></canvas>
+      </div>
+      <div class="panel" id="panelFrame">
+        <div class="title"><span>Current CSI frame, with the previous 0.5 s shown faintly</span><output id="hoverFrame"></output></div>
+        <canvas id="frame"></canvas>
+      </div>
+      <div class="panel" id="panelMotion">
+        <div class="title"><span>Motion (variance over 0.5 s)</span><output id="hoverMotion"></output></div>
+        <div class="chart" id="chartMotion"></div>
+        <div class="title"><span>RSSI (dBm)</span><output id="hoverRssi"></output></div>
+        <div class="chart" id="chartRssi"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer id="controls">
+    <button id="play" title="Space">Play</button>
+    <input id="timeline" type="range" min="0" value="0" step="1" aria-label="Timeline">
+    <label>Speed
+      <select id="speed">
+        <option>0.25</option><option>0.5</option><option>0.75</option><option selected>1</option><option>1.5</option><option>2</option>
+      </select>
+    </label>
+    <label>Window
+      <select id="window">
+        <option value="2">±2 s</option><option value="5">±5 s</option><option value="10" selected>±10 s</option><option value="30">±30 s</option><option value="60">±60 s</option>
+      </select>
+    </label>
+    <label><input id="normalized" type="checkbox" checked> Normalize per frame</label>
+    <label class="sync">Sync offset
+      <input id="offset" type="range" min="-500" max="500" step="1" value="0" aria-label="Sync offset in milliseconds">
+      <output id="offsetValue">0 ms</output>
+      <output id="offsetSaved"></output>
+    </label>
+    <span class="keys">Space play · ←/→ video frame · Shift+←/→ CSI frame</span>
+  </footer>
+
+  <script src="vendor/uPlot.iife.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
