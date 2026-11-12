@@ -8,6 +8,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { height: 100%; margin: 0; }
 
 body {
@@ -40,6 +41,14 @@ main {
 
 #left {
   display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  min-width: 0;
+}
+#videoBox {
+  flex: 1 1 0;
+  display: flex;
   align-items: center;
   justify-content: center;
   background: #000;
@@ -48,6 +57,7 @@ main {
   min-width: 0;
 }
 video { display: block; max-width: 100%; max-height: 100%; }
+#detailsPanel { flex: 0 0 42%; }
 
 #right {
   display: grid;
@@ -77,8 +87,94 @@ video { display: block; max-width: 100%; max-height: 100%; }
   font-variant-numeric: tabular-nums;
 }
 .title output { color: var(--ink); overflow: hidden; text-overflow: ellipsis; }
-canvas#waterfall, canvas#frame { flex: 1 1 0; min-height: 0; min-width: 0; width: 100%; display: block; }
+canvas#waterfall, canvas#frame, canvas#spectrogram, canvas#spectrum { flex: 1 1 0; min-height: 0; min-width: 0; width: 100%; display: block; }
 .chart { flex: 1 1 0; min-height: 0; min-width: 0; overflow: hidden; }
+
+#right[data-mode="frequency"] { grid-template-rows: auto minmax(0, 40fr) minmax(0, 28fr) minmax(0, 32fr); }
+#right[data-mode="details"] { grid-template-rows: minmax(0, 1fr); }
+
+/* CSI details: field list on top, scrolling subcarrier table below. */
+.detailsView { display: flex; flex-direction: column; gap: 6px; flex: 1 1 0; min-height: 0; padding-top: 4px; }
+.detailsView .fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 2px 16px;
+  font-variant-numeric: tabular-nums;
+}
+.detailsView .fields > div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.detailsView .fields .label { color: var(--muted); margin-right: 8px; }
+.detailsView .tableScroll { flex: 1 1 0; min-height: 60px; overflow: auto; border-top: 1px solid var(--line); }
+.detailsView table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.detailsView th {
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+  color: var(--muted);
+  font-weight: 500;
+  text-align: right;
+  padding: 3px 10px;
+  border-bottom: 1px solid var(--line);
+}
+.detailsView td { text-align: right; padding: 1px 10px; }
+.detailsView tr.null td { color: #6b6a66; }
+.detailsView .note { margin: 0; color: var(--muted); font-size: 12px; }
+/* Under the video there is little height, so fields and table sit side by side. */
+.detailsView.compact {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 4px 12px;
+}
+.detailsView.compact > .note { grid-column: 1 / -1; grid-row: 3; }
+.detailsView.compact > .note:first-child { grid-row: 1; }  /* the loading / error line */
+.detailsView.compact .fields { display: block; grid-row: 2; overflow: auto; line-height: 1.35; }
+.detailsView.compact .tableScroll { grid-row: 2; min-height: 0; border-top: 0; }
+.detailsView.compact th, .detailsView.compact td { padding-inline: 6px; }
+#freqControls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  padding: 6px 8px;
+  background: var(--surface);
+  border-radius: 4px;
+}
+#freqControls label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); white-space: nowrap; }
+#freqControls output { font-variant-numeric: tabular-nums; }
+#freqControls select { padding: 2px 6px; }
+#freqControls input[type="number"] {
+  width: 62px;
+  padding: 2px 4px;
+  color: var(--ink);
+  background: #2b2b29;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font: inherit;
+}
+#freqControls input:disabled { color: var(--muted); }
+#freqStatus { margin-left: auto; }
+#freqStatus.busy::before {
+  content: "";
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 6px;
+  border: 2px solid var(--muted);
+  border-top-color: transparent;
+  border-radius: 50%;
+  vertical-align: -1px;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { #freqStatus.busy::before { animation: none; } }
+.legend { display: flex; flex-wrap: wrap; gap: 0 14px; color: var(--muted); font-size: 12px; }
+.legend span { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.legend i { width: 10px; height: 10px; border-radius: 2px; }
+.mode { display: inline-flex; }
+.mode button { min-width: 0; border-radius: 0; }
+.mode button:first-child { border-radius: 4px 0 0 4px; }
+.mode button:last-child { border-radius: 0 4px 4px 0; border-left: 0; }
+.mode button[aria-pressed="true"] { background: #1c5cab; border-color: #1c5cab; }
 
 #controls {
   display: flex;
@@ -110,6 +206,10 @@ button { min-width: 70px; cursor: pointer; }
   html, body { height: auto; }
   main { grid-template-columns: minmax(0, 1fr); }
   #right { grid-template-rows: 240px 180px 260px; }
+  #right[data-mode="frequency"] { grid-template-rows: auto 240px 180px 260px; }
+  #right[data-mode="details"] { grid-template-rows: 520px; }
+  #videoBox { flex: 0 0 auto; }
+  #detailsPanel { flex: 0 0 auto; height: 420px; }
   .keys { margin-left: 0; }
   #offset { width: 140px; }
 }

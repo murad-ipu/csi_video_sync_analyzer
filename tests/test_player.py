@@ -71,6 +71,32 @@ def test_meta_drops_null_bins_and_array_sizes_match(client):
     assert np.frombuffer(client.get("/api/array/chart_motion").content, "<f4").size < meta["n_csi"]
 
 
+def test_details_arrays_match_csi_npz_exactly(client, session):
+    folder, _ = session
+    meta = client.get("/api/meta").json()
+    stored = np.load(folder / "csi.npz")
+    assert meta["n_subcarriers"] == 64
+    assert "csi_iq" in meta["detail_arrays"] and "pc_receive_t_ns" in meta["detail_arrays"]
+    iq = np.frombuffer(client.get("/api/array/csi_iq").content, "i1").reshape(meta["n_csi"], 128)
+    assert (iq == stored["csi_data"]).all()
+    # Nanosecond times exceed 2**53, so they must arrive as exact 64-bit integers.
+    for name in ("csi_t_ns", "pc_receive_t_ns", "device_ticks_us"):
+        values = np.frombuffer(client.get(f"/api/array/{name}").content, "<i8")
+        assert (values == stored[name].astype(np.int64)).all()
+
+
+def test_details_mode_and_panel_are_saved(client, session):
+    folder, _ = session
+    settings = {"window_s": 2.0, "hop_s": 0.1, "method": "motion", "freq_max_hz": 5,
+                "color_auto": True, "color_min": -60, "color_max": 0}
+    response = client.post("/api/player_settings", json={"mode": "details", "details_panel": True, "frequency": settings})
+    assert response.status_code == 200
+    saved = json.loads((folder / "session.json").read_text())["player_settings"]
+    assert saved["mode"] == "details" and saved["details_panel"] is True
+    assert saved["frequency"]["method"] == "motion"
+    client.post("/api/player_settings", json={"mode": "time", "frequency": settings})
+
+
 def test_unknown_array_is_404(client):
     assert client.get("/api/array/secret").status_code == 404
 

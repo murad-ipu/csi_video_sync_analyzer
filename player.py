@@ -9,10 +9,12 @@ arrays, so the page never waits for the server while you scrub or step.
 
 import argparse
 import json
+import re
 import socket
 import threading
 import webbrowser
 from pathlib import Path
+from typing import Literal
 
 import av
 import numpy as np
@@ -20,51 +22,26 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 import espectre_path
+import frequency
 import timesync
+from frequency import MOTION_WINDOW_S, motion_signal, normalize_per_frame, select_subcarriers
 from record import read_json, write_json_atomic
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-MOTION_WINDOW_S = 0.5
 MOTION_CHART_HZ = 25.0  # the charts need far fewer points than the 100 Hz source
 SYNC_WINDOW_S = 0.2     # shorter window for the automatic offset estimate
-MIN_NONZERO_FRACTION = 0.5
+# csi.npz fields shown by the CSI details view. Integers that can exceed 2**53
+# go as int64 so the page shows them exactly.
+DETAIL_FIELDS = {
+    "csi_t_ns": "i8", "pc_receive_t_ns": "i8", "perf_receive_t_ns": "i8", "device_ticks_us": "i8",
+    "wifi_rx_ts_us": "i8", "seq_num": "i8", "stream_sequence": "i8", "noise_floor_dbm": "f4", "channel": "f4",
+}
 
 
 # --- Signal processing (plain functions, unit tested) --------------------------------
-
-def select_subcarriers(amplitude: np.ndarray) -> np.ndarray:
-    """Indices of subcarriers carrying signal; guard and null bins read zero."""
-    return np.flatnonzero((amplitude > 0).mean(axis=0) >= MIN_NONZERO_FRACTION)
-
-
-def normalize_per_frame(amplitude: np.ndarray) -> np.ndarray:
-    """Divide each frame by its mean, which removes the per-packet AGC scale."""
-    mean = amplitude.mean(axis=1, keepdims=True)
-    return np.divide(amplitude, mean, out=np.zeros_like(amplitude), where=mean > 0)
-
-
-def motion_signal(t_s: np.ndarray, normalized: np.ndarray, window_s: float = MOTION_WINDOW_S) -> np.ndarray:
-    """Variance of normalized amplitude in a sliding window, averaged over subcarriers.
-
-    The window is centered on each frame: a trailing window would make every
-    motion peak appear late and look like a sync error.
-    """
-    if t_s.size == 0:
-        return np.zeros(0, dtype=np.float32)
-    data = normalized.astype(np.float64)
-    zero = np.zeros((1, data.shape[1]))
-    sum_1 = np.concatenate((zero, np.cumsum(data, axis=0)))
-    sum_2 = np.concatenate((zero, np.cumsum(data**2, axis=0)))
-    low = np.searchsorted(t_s, t_s - window_s / 2, side="left")
-    high = np.searchsorted(t_s, t_s + window_s / 2, side="right")
-    count = (high - low)[:, None].astype(np.float64)
-    mean = (sum_1[high] - sum_1[low]) / count
-    variance = (sum_2[high] - sum_2[low]) / count - mean**2
-    return np.maximum(variance, 0.0).mean(axis=1).astype(np.float32)
-
 
 def video_motion_energy(path: Path) -> np.ndarray:
     """Mean absolute difference between consecutive small grayscale frames."""
@@ -127,6 +104,15 @@ def load_session(folder: Path, repo=None) -> dict:
         "chart_motion": ("f4", motion[::stride]),
         "chart_rssi": ("f4", rssi[::stride]),
     }
+    # Raw contents for the CSI details view. The page only downloads them when it is opened.
+    detail_arrays = []
+    if "csi_data" in csi:
+        arrays["csi_iq"] = ("i1", np.asarray(csi["csi_data"]))
+        detail_arrays.append("csi_iq")
+    for name, dtype in DETAIL_FIELDS.items():
+        if name in csi:
+            arrays[name] = (dtype, np.asarray(csi[name]))
+            detail_arrays.append(name)
     payloads = {name: np.asarray(values, dtype=dtype).tobytes() for name, (dtype, values) in arrays.items()}
     meta = {
         "n_frames": int(frame_t_s.size),
@@ -138,7 +124,10 @@ def load_session(folder: Path, repo=None) -> dict:
         "motion_max": float(np.percentile(motion, 99.9)) * 1.1 or 1.0,
         "rssi_range": [float(rssi.min()) - 2.0, float(rssi.max()) + 2.0],
         "motion_window_s": MOTION_WINDOW_S,
+        "detail_arrays": detail_arrays,
+        "n_subcarriers": int(np.asarray(csi["csi_data"]).shape[1] // 2) if "csi_data" in csi else 0,
         "sync_offset_ms": float(session.get("sync_offset_ms", 0)),
+        "player_settings": session.get("player_settings", {}),
         "summary": {
             "status": session.get("status"),
             "fit_residual_rms_ms": session.get("time_fit", {}).get("residual_rms_ms"),
@@ -168,10 +157,38 @@ class SyncOffset(BaseModel):
     sync_offset_ms: float = Field(ge=-2000, le=2000, allow_inf_nan=False)
 
 
+class FrequencyRequest(BaseModel):
+    window_s: float
+    hop_s: float = Field(ge=0.05, le=0.5, allow_inf_nan=False)
+    method: Literal["mean", "pca1", "pca2", "motion"]
+
+    @field_validator("window_s")
+    @classmethod
+    def window_is_offered(cls, value: float) -> float:
+        if value not in frequency.WINDOW_CHOICES_S:
+            raise ValueError(f"window_s must be one of {frequency.WINDOW_CHOICES_S}")
+        return value
+
+
+class FrequencySettings(FrequencyRequest):
+    freq_max_hz: float = Field(gt=0, le=1000, allow_inf_nan=False)
+    color_auto: bool
+    color_min: float = Field(ge=-400, le=400, allow_inf_nan=False)
+    color_max: float = Field(ge=-400, le=400, allow_inf_nan=False)
+
+
+class PlayerSettings(BaseModel):
+    mode: Literal["time", "frequency", "details"]
+    details_panel: bool = False  # the CSI details panel under the video
+    frequency: FrequencySettings
+
+
 def create_app(data: dict) -> FastAPI:
     app = FastAPI(title="CSI video player", docs_url=None, redoc_url=None, openapi_url=None)
     folder, meta, payloads = data["folder"], data["meta"], data["payloads"]
     write_lock = threading.Lock()
+    compute_lock = threading.Lock()  # a second request for the same result then finds it cached
+    amplitude = np.frombuffer(payloads["amp_raw"], dtype="f4").reshape(meta["n_csi"], len(meta["kept_bins"]))
 
     @app.get("/api/meta")
     def get_meta():
@@ -196,6 +213,44 @@ def create_app(data: dict) -> FastAPI:
             write_json_atomic(folder / "session.json", session)
             meta["sync_offset_ms"] = body.sync_offset_ms
         return {"sync_offset_ms": body.sync_offset_ms}
+
+    @app.post("/api/player_settings")
+    def set_player_settings(body: PlayerSettings):
+        with write_lock:
+            session = read_json(folder / "session.json")
+            previous = session.get("player_settings", {}).get("frequency", {})
+            # Bands are edited by hand in session.json, so the page never overwrites them.
+            bands = previous.get("bands", frequency.bands_to_json(frequency.DEFAULT_BANDS))
+            settings = {
+                "mode": body.mode,
+                "details_panel": body.details_panel,
+                "frequency": {**body.frequency.model_dump(), "bands": bands},
+            }
+            session["player_settings"] = settings
+            write_json_atomic(folder / "session.json", session)
+            meta["player_settings"] = settings
+        return settings
+
+    @app.post("/api/frequency")
+    def compute_frequency(body: FrequencyRequest):
+        with write_lock:
+            stored = read_json(folder / "session.json").get("player_settings", {}).get("frequency", {})
+        try:
+            bands = frequency.parse_bands(stored.get("bands"))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        params = frequency.FrequencyParams(window_s=body.window_s, hop_s=body.hop_s, method=body.method, bands=bands)
+        with compute_lock:
+            key, info, was_cached = frequency.load_or_compute(folder, data["csi_t_s"], amplitude, params)
+        return {**info, "key": key, "cached": was_cached}
+
+    @app.get("/api/frequency/{key}/{name}")
+    def get_frequency_array(key: str, name: str):
+        if name not in frequency.CACHE_ARRAYS or not re.fullmatch(r"[0-9a-f]{20}", key):
+            raise HTTPException(404, "unknown array")
+        if not frequency.cache_path(folder, key).is_file():
+            raise HTTPException(404, "unknown result")
+        return Response(frequency.read_cached_array(folder, key, name), media_type="application/octet-stream")
 
     app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
     return app
