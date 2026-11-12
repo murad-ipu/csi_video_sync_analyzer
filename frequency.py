@@ -4,6 +4,10 @@ The steps, in order: resample onto a uniform grid, normalize each frame, then
 for every analysis window remove the mean, apply a Hann window, take the FFT,
 combine the subcarriers, and convert to dB.
 
+The "motion" method analyzes the player's motion signal instead: per-frame
+normalization and the 0.5 s sliding variance happen on the CSI frames first,
+exactly as for the Time-mode chart, and that single signal is resampled.
+
 All column times are in CSI time, without the sync offset. The page adds the
 offset when drawing, as it does for the motion chart, so moving the offset
 slider never needs a recompute.
@@ -27,7 +31,9 @@ SAMPLE_RATE_HZ = 100.0
 MAX_GAP_S = 0.05
 MAX_MISSING_FRACTION = 0.10
 WINDOW_CHOICES_S = (0.5, 1.0, 2.0, 5.0, 10.0, 20.0)
-METHODS = {"mean": 0, "pca1": 1, "pca2": 2}  # value = principal component used
+METHODS = ("mean", "pca1", "pca2", "motion")
+PCA_COMPONENT = {"pca1": 1, "pca2": 2}
+MOTION_WINDOW_S = 0.5       # the motion chart's window; the motion method uses the same
 DEFAULT_BANDS = (
     ("breathing", 0.1, 0.5),
     ("slow movement", 0.5, 2.0),
@@ -52,6 +58,7 @@ class FrequencyParams:
     max_gap_s: float = MAX_GAP_S
     max_missing: float = MAX_MISSING_FRACTION
     bands: tuple = DEFAULT_BANDS
+    motion_window_s: float = MOTION_WINDOW_S
 
 
 def select_subcarriers(amplitude: np.ndarray) -> np.ndarray:
@@ -63,6 +70,26 @@ def normalize_per_frame(amplitude: np.ndarray) -> np.ndarray:
     """Divide each frame by its mean, which removes the per-packet AGC scale."""
     mean = amplitude.mean(axis=1, keepdims=True)
     return np.divide(amplitude, mean, out=np.zeros_like(amplitude), where=mean > 0)
+
+
+def motion_signal(t_s: np.ndarray, normalized: np.ndarray, window_s: float = MOTION_WINDOW_S) -> np.ndarray:
+    """Variance of normalized amplitude in a sliding window, averaged over subcarriers.
+
+    The window is centered on each frame: a trailing window would make every
+    motion peak appear late and look like a sync error.
+    """
+    if t_s.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    data = normalized.astype(np.float64)
+    zero = np.zeros((1, data.shape[1]))
+    sum_1 = np.concatenate((zero, np.cumsum(data, axis=0)))
+    sum_2 = np.concatenate((zero, np.cumsum(data**2, axis=0)))
+    low = np.searchsorted(t_s, t_s - window_s / 2, side="left")
+    high = np.searchsorted(t_s, t_s + window_s / 2, side="right")
+    count = (high - low)[:, None].astype(np.float64)
+    mean = (sum_1[high] - sum_1[low]) / count
+    variance = (sum_2[high] - sum_2[low]) / count - mean**2
+    return np.maximum(variance, 0.0).mean(axis=1).astype(np.float32)
 
 
 def parse_bands(raw) -> tuple:
@@ -146,13 +173,28 @@ def _band_masks(freqs: np.ndarray, bands: tuple) -> list:
     return [(freqs > low + FLOAT_TOLERANCE) & (freqs <= high + FLOAT_TOLERANCE) for _, low, high in bands]
 
 
-def compute_spectra(t_s: np.ndarray, amplitude: np.ndarray, params: FrequencyParams) -> dict:
-    """Run the whole analysis. power is (columns, bins) in dB; a skipped window is NaN."""
+def prepare_grid(t_s: np.ndarray, amplitude: np.ndarray, params: FrequencyParams):
+    """The uniform-grid input to the STFT: (grid, channels, missing).
+
+    channels is (samples, 52-ish subcarriers) of normalized amplitude, or for
+    the motion method (samples, 1) holding the motion signal.
+    """
     kept = select_subcarriers(amplitude)
     measured = amplitude[:, kept]
     has_signal = measured.sum(axis=1) > 0  # an all-zero frame is a lost frame, so it becomes a gap
-    grid, resampled, missing = resample_uniform(t_s[has_signal], measured[has_signal], params.fs_hz, params.max_gap_s)
-    normalized = normalize_per_frame(resampled)
+    t_used, a_used = t_s[has_signal], measured[has_signal]
+    if params.method == "motion":
+        # Same order as the Time-mode chart: normalize, then the sliding variance, on the real frames.
+        motion = motion_signal(t_used, normalize_per_frame(a_used.astype(np.float32)), params.motion_window_s)
+        # One channel: dividing it by its own mean would turn every sample into 1.
+        return resample_uniform(t_used, motion[:, None], params.fs_hz, params.max_gap_s)
+    grid, resampled, missing = resample_uniform(t_used, a_used, params.fs_hz, params.max_gap_s)
+    return grid, normalize_per_frame(resampled), missing
+
+
+def compute_spectra(t_s: np.ndarray, amplitude: np.ndarray, params: FrequencyParams) -> dict:
+    """Run the whole analysis. power is (columns, bins) in dB; a skipped window is NaN."""
+    grid, normalized, missing = prepare_grid(t_s, amplitude, params)
 
     n = max(2, int(round(params.window_s * params.fs_hz)))
     hop = max(1, int(round(params.hop_s * params.fs_hz)))
@@ -174,7 +216,7 @@ def compute_spectra(t_s: np.ndarray, amplitude: np.ndarray, params: FrequencyPar
         usable = np.flatnonzero(missing_count <= params.max_missing * n + FLOAT_TOLERANCE)
     if usable.size:
         K = normalized.shape[1]
-        component = METHODS[params.method]
+        component = PCA_COMPONENT.get(params.method, 0)  # 0: average the channels' spectra
         hann = np.hanning(n).astype(np.float32)
         window_view = np.lib.stride_tricks.sliding_window_view(normalized, n, axis=0)
         valid_view = np.lib.stride_tricks.sliding_window_view(~missing, n)

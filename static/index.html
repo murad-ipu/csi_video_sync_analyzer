@@ -19,7 +19,13 @@
 
   <main>
     <section id="left">
-      <video id="video" src="video.mp4" muted playsinline preload="auto"></video>
+      <div id="videoBox">
+        <video id="video" src="video.mp4" muted playsinline preload="auto"></video>
+      </div>
+      <div class="panel" id="detailsPanel" hidden>
+        <div class="title"><span>CSI frame contents (csi.npz)</span></div>
+        <div class="detailsView" id="detailsDock"></div>
+      </div>
     </section>
 
     <section id="right">
@@ -51,7 +57,7 @@
         </label>
         <label title="How the subcarriers are combined">Combine
           <select id="freqMethod">
-            <option value="mean" selected>Mean</option><option value="pca1">PCA 1</option><option value="pca2">PCA 2</option>
+            <option value="mean" selected>Mean</option><option value="pca1">PCA 1</option><option value="pca2">PCA 2</option><option value="motion">Motion variance</option>
           </select>
         </label>
         <label>Range
@@ -78,13 +84,17 @@
         <div class="legend" id="bandLegend"></div>
         <div class="chart" id="chartBands"></div>
       </div>
+      <div class="panel" id="panelDetails" hidden>
+        <div class="title"><span>CSI frame contents (csi.npz), for the CSI frame matched to the video</span></div>
+        <div class="detailsView" id="detailsMain"></div>
+      </div>
     </section>
   </main>
 
   <footer id="controls">
     <button id="play" title="Space">Play</button>
     <div class="mode" role="group" aria-label="View">
-      <button id="modeTime" aria-pressed="true">Time</button><button id="modeFrequency" aria-pressed="false">Frequency</button>
+      <button id="mode_time" aria-pressed="true">Time</button><button id="mode_frequency" aria-pressed="false">Frequency</button><button id="mode_details" aria-pressed="false">Details</button>
     </div>
     <input id="timeline" type="range" min="0" value="0" step="1" aria-label="Timeline">
     <label>Speed
@@ -98,6 +108,7 @@
       </select>
     </label>
     <label id="normalizedLabel"><input id="normalized" type="checkbox" checked> Normalize per frame</label>
+    <label><input id="detailsToggle" type="checkbox"> CSI details</label>
     <label class="sync">Sync offset
       <input id="offset" type="range" min="-500" max="500" step="1" value="0" aria-label="Sync offset in milliseconds">
       <output id="offsetValue">0 ms</output>
@@ -108,6 +119,7 @@
 
   <script src="vendor/uPlot.iife.min.js"></script>
   <script src="frequency.js"></script>
+  <script src="details.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

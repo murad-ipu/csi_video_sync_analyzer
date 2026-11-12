@@ -107,6 +107,41 @@ def test_a_band_with_no_bins_is_reported_and_stays_nan():
     assert np.isnan(result["band_power"][:, 0]).all()
 
 
+# --- Motion variance method -----------------------------------------------------------
+
+SINE_COLUMNS = [2, 3, 4, 5, 6, 7]
+
+
+def test_motion_input_is_the_time_mode_motion_signal():
+    t = timeline(20.0)
+    amplitude = noisy_base(t)
+    modulate(amplitude, t, 1.0, SINE_COLUMNS)
+    grid, channels, missing = frequency.prepare_grid(t, amplitude, FrequencyParams(method="motion"))
+    kept = frequency.select_subcarriers(amplitude)
+    expected = frequency.motion_signal(t, frequency.normalize_per_frame(amplitude[:, kept].astype(np.float32)))
+    assert player.motion_signal is frequency.motion_signal  # the chart and this view share one function
+    assert channels.shape == (t.size, 1) and not missing.any()
+    assert channels[:, 0] == pytest.approx(expected, rel=1e-4, abs=1e-9)
+
+
+def test_motion_spectrum_shows_a_slow_sine_at_twice_its_frequency():
+    t = timeline()
+    amplitude = noisy_base(t)
+    modulate(amplitude, t, 0.25, SINE_COLUMNS)
+    result = compute_spectra(t, amplitude, FrequencyParams(window_s=20.0, hop_s=0.5, method="motion"))
+    assert peak_hz(result) == pytest.approx(0.5, abs=result["info"]["df_hz"])
+
+
+def test_motion_method_keeps_long_gaps_missing():
+    t = timeline(30.0)
+    amplitude = noisy_base(t)
+    keep = (t < 10.0) | (t >= 14.0)
+    result = compute_spectra(t[keep], amplitude[keep], FrequencyParams(window_s=2.0, hop_s=0.1, method="motion"))
+    columns = result["t"]
+    assert np.isnan(result["power"][(columns > 11.0) & (columns < 13.0)]).all()
+    assert np.isfinite(result["power"][columns < 8.0]).all()
+
+
 # --- Resampling and gaps --------------------------------------------------------------
 
 def test_resampling_interpolates_linearly_onto_an_exact_grid():
@@ -257,6 +292,13 @@ def test_a_damaged_cache_file_is_recomputed(client, session):
     key = client.post("/api/frequency", json=settings).json()["key"]
     frequency.cache_path(folder, key).write_bytes(b"not a zip file")
     assert client.post("/api/frequency", json=settings).json()["cached"] is False
+
+
+def test_api_accepts_the_motion_method_as_its_own_result(client):
+    mean = client.post("/api/frequency", json=REQUEST).json()
+    motion = client.post("/api/frequency", json={**REQUEST, "method": "motion"})
+    assert motion.status_code == 200
+    assert motion.json()["method"] == "motion" and motion.json()["key"] != mean["key"]
 
 
 def test_csi_times_in_the_response_exclude_the_sync_offset(client):

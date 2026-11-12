@@ -5,8 +5,6 @@
 
 const BAND_COLORS = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"];
 const MISSING_GREY = [72, 72, 69];
-const TIME_PANEL_IDS = ["panelWaterfall", "panelFrame", "panelMotion"];
-const FREQUENCY_PANEL_IDS = ["freqControls", "panelSpectrogram", "panelSpectrum", "panelBands"];
 const MAX_HELD_BYTES = 256 * 1024 * 1024;  // results the page keeps for instant switching
 const MAX_RANGE_SAMPLES = 200000;
 const BUSY_DELAY_MS = 120;
@@ -15,7 +13,7 @@ const fq = {
   settings: { window_s: 2, hop_s: 0.1, method: "mean", freq_max_hz: 50, color_auto: true, color_min: -60, color_max: 0 },
   data: null, held: new Map(), heldBytes: 0, requestId: 0,
   colorLimits: [-60, 0], spectrumRange: [-60, 0],
-  bandPlot: null, bandX: null, bandValues: [], saveTimer: null,
+  bandPlot: null, bandX: null, bandValues: [],
   heatCanvas: document.createElement("canvas"), heatImage: null,
 };
 
@@ -38,35 +36,13 @@ function readControls() {
   $("colorMin").disabled = $("colorMax").disabled = fq.settings.color_auto;
 }
 
-function saveSettings() {
-  clearTimeout(fq.saveTimer);
-  fq.saveTimer = setTimeout(() => {
-    fetch("api/player_settings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode: state.mode, frequency: fq.settings }),
-    }).catch(() => {});  // settings are a convenience: playback must never depend on them
-  }, 300);
-}
-
-function setMode(mode, save) {
-  state.mode = mode;
-  const frequency = mode === "frequency";
-  for (const id of TIME_PANEL_IDS) $(id).hidden = frequency;
-  for (const id of FREQUENCY_PANEL_IDS) $(id).hidden = !frequency;
-  $("normalizedLabel").hidden = frequency;  // that checkbox only affects the time panels
-  $("right").classList.toggle("frequency", frequency);
-  $("modeTime").setAttribute("aria-pressed", String(!frequency));
-  $("modeFrequency").setAttribute("aria-pressed", String(frequency));
-  resizeVisibleCharts();
-  if (frequency && !fq.data) requestFrequency();
-  queueRender();
-  if (save) saveSettings();
+// Called by setMode in app.js each time Frequency mode is shown.
+function showFrequency() {
+  if (!fq.data) requestFrequency();
 }
 
 function initFrequency() {
-  const saved = meta.player_settings || {};
-  const stored = saved.frequency || {};
+  const stored = (meta.player_settings || {}).frequency || {};
   restoreSelect("freqWindow", stored.window_s);
   restoreSelect("freqHop", stored.hop_s);
   restoreSelect("freqMethod", stored.method);
@@ -77,10 +53,10 @@ function initFrequency() {
   readControls();
 
   for (const id of ["freqWindow", "freqHop", "freqMethod"]) {
-    $(id).onchange = (event) => { event.target.blur(); readControls(); requestFrequency(); saveSettings(); };
+    $(id).onchange = (event) => { event.target.blur(); readControls(); requestFrequency(); savePlayerSettings(); };
   }
   for (const id of ["freqRange", "colorMin", "colorMax"]) {
-    $(id).onchange = (event) => { event.target.blur(); readControls(); updateDisplayRanges(); queueRender(); saveSettings(); };
+    $(id).onchange = (event) => { event.target.blur(); readControls(); updateDisplayRanges(); queueRender(); savePlayerSettings(); };
   }
   $("colorAuto").onchange = (event) => {
     event.target.blur();
@@ -91,12 +67,9 @@ function initFrequency() {
     readControls();
     updateDisplayRanges();
     queueRender();
-    saveSettings();
+    savePlayerSettings();
   };
-  $("modeTime").onclick = (event) => { event.target.blur(); setMode("time", true); };
-  $("modeFrequency").onclick = (event) => { event.target.blur(); setMode("frequency", true); };
   bindFrequencyHover();
-  setMode(saved.mode === "frequency" ? "frequency" : "time", false);
 }
 
 // --- Getting results from the backend --------------------------------------------
@@ -165,7 +138,9 @@ async function requestFrequency() {
 function installResult(result) {
   fq.data = result;
   const skipped = result.n_skipped ? ` · ${result.n_skipped} of ${result.n_columns} windows skipped` : "";
-  $("freqInfo").textContent = `Resolution ${formatNumber(result.df_hz)} Hz · Sample rate ${formatNumber(result.fs_hz)} Hz${skipped}`;
+  // The 0.5 s variance window suppresses everything above about 2 Hz before the FFT.
+  const source = result.method === "motion" ? " · Source: motion variance, mostly below 2 Hz" : "";
+  $("freqInfo").textContent = `Resolution ${formatNumber(result.df_hz)} Hz · Sample rate ${formatNumber(result.fs_hz)} Hz${skipped}${source}`;
   updateDisplayRanges();
   buildBandPlot(result);
   queueRender();
@@ -223,6 +198,37 @@ function drawCanvasMessage(ctx, width, height, text) {
   ctx.fillText(text, width / 2, height / 2);
 }
 
+// Spectra exist only where a whole window fits: from half a window after the start
+// to half a window before the end. Returned on the video clock.
+function coverage(ds) {
+  return [ds.t[0] + state.offsetS - ds.hop_s / 2, ds.t[ds.n_columns - 1] + state.offsetS + ds.hop_s / 2];
+}
+
+function edgeLines(ds, before) {
+  const [first, last] = coverage(ds);
+  const edge = before ? ds.t[0] + state.offsetS : ds.t[ds.n_columns - 1] + state.offsetS;
+  return [
+    `No spectrum ${before ? "before" : "after"} ${edge.toFixed(1)} s`,
+    `A ${formatNumber(ds.window_s)} s window needs ${formatNumber(ds.window_s / 2)} s of data on each side`,
+  ];
+}
+
+// Labels the stretches without spectra so they do not look like missing data.
+function drawEdgeNotes(ctx, ds, toX, left, right, middleY, fontPx) {
+  const [first, last] = coverage(ds);
+  ctx.save();
+  ctx.font = `${fontPx}px system-ui, 'Segoe UI', sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = COLORS.muted;
+  for (const [x0, x1, before] of [[left, Math.min(right, toX(first)), true], [Math.max(left, toX(last)), right, false]]) {
+    const room = x1 - x0 - 12;
+    const lines = edgeLines(ds, before).filter((line) => ctx.measureText(line).width <= room);
+    lines.forEach((line, n) => ctx.fillText(line, (x0 + x1) / 2, middleY + (n - (lines.length - 1) / 2) * fontPx * 1.4));
+  }
+  ctx.restore();
+}
+
 function emptyMessage() {
   if (!fq.data) return "Computing...";
   return `This recording is shorter than the ${formatNumber(fq.data.window_s)} s window`;
@@ -276,6 +282,8 @@ function drawSpectrogram() {
   fq.heatCanvas.getContext("2d").putImageData(fq.heatImage, 0, 0);
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(fq.heatCanvas, MARGIN.left, MARGIN.top, plotW, plotH);
+  const toX = (t) => MARGIN.left + ((t - start) / span) * plotW;
+  drawEdgeNotes(ctx, ds, toX, MARGIN.left, MARGIN.left + plotW, MARGIN.top + plotH / 2, 11);
 
   ctx.fillStyle = COLORS.muted;
   ctx.textAlign = "right";
@@ -335,6 +343,16 @@ function drawSpectrum() {
     ctx.fillText(`${formatNumber(hz)} Hz`, Math.max(MARGIN.left + 16, Math.min(width - 24, toX(hz))), height - 8);
   }
 
+  // Before the first or after the last window there is no spectrum for this moment.
+  const [first, last] = coverage(ds), now = cursorTime();
+  if (now < first || now > last) {
+    $("spectrumWhen").textContent = "no window covers this moment";
+    const lines = edgeLines(ds, now < first);
+    ctx.fillStyle = COLORS.muted;
+    ctx.textAlign = "center";
+    lines.forEach((line, n) => ctx.fillText(line, MARGIN.left + plotW / 2, MARGIN.top + plotH / 2 + (n - 0.5) * 16));
+    return;
+  }
   const column = cursorColumn(ds);
   $("spectrumWhen").textContent = `window centered at ${(ds.t[column] + state.offsetS).toFixed(2)} s`;
   const offset = column * ds.n_freqs;
@@ -399,7 +417,11 @@ function buildBandPlot(ds) {
     ],
     series: [{}, ...ds.bands.map((band, index) => ({ label: band.name, stroke: BAND_COLORS[index], width: 2, points: { show: false } }))],
     hooks: {
-      draw: [drawCursorLine],
+      draw: [drawCursorLine, (plot) => {
+        // uPlot draws in device pixels.
+        const ratio = window.devicePixelRatio || 1, box = plot.bbox;
+        drawEdgeNotes(plot.ctx, ds, (t) => plot.valToPos(t, "x", true), box.left, box.left + box.width, box.top + box.height / 2, 11 * ratio);
+      }],
       setCursor: [(plot) => {
         const i = plot.cursor.idx;
         if (i == null) { $("hoverBands").textContent = ""; return; }
