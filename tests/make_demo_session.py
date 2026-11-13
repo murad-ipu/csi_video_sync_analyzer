@@ -17,8 +17,12 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import espectre_bridge  # noqa: E402
+import espectre_path  # noqa: E402
 import record  # noqa: E402
 import timesync  # noqa: E402
+
+espectre_path.setup()
 
 PC_START_NS = 1_780_000_000_000_000_000
 NUM_SC = 64
@@ -77,15 +81,21 @@ def make_session(folder: Path, seconds: float, offset_ms: float, width=1280, hei
     amplitude[:, NULL_BINS] = 0
     iq = np.zeros((n_csi, NUM_SC * 2), np.int8)
     iq[:, 1::2] = np.clip(np.rint(amplitude), -127, 127)
+    # Same as a real recording: amplitude and phase from ESPectre, computed from the stored I/Q.
+    stored_amplitude, phase = espectre_bridge.amplitude_phase(iq)
 
     np.savez(
         folder / "csi.npz",
         pc_receive_t_ns=received_ns, perf_receive_t_ns=received_ns, csi_t_ns=fit.to_pc_ns(ticks),
         device_ticks_us=ticks, wifi_rx_ts_us=ticks & 0xFFFFFFFF, seq_num=np.arange(n_csi), stream_sequence=np.arange(n_csi),
         rssi_dbm=(-50 + rng.integers(-2, 3, n_csi)).astype(np.int8), noise_floor_dbm=np.full(n_csi, -96, np.int8),
-        channel=np.full(n_csi, 6, np.uint8), csi_data=iq, amplitude=amplitude.astype(np.float32),
+        channel=np.full(n_csi, 6, np.uint8), csi_data=iq, amplitude=stored_amplitude, phase=phase,
+        csi_target_pps=np.int64(100),
     )
-    (folder / "csi_meta.json").write_text(json.dumps({"subcarrier_count": NUM_SC, "record_version": 8, "synthetic": True}))
+    sensing = {"enabled": True, "detector": "high_accuracy", "threshold": 0.5,
+               "motion_on_hits": 4, "motion_off_hits": 3, "csi_target_pps": 100}
+    (folder / "csi_meta.json").write_text(json.dumps(
+        {"subcarrier_count": NUM_SC, "record_version": 8, "synthetic": True, "sensing": sensing}))
     (folder / "session.json").write_text(json.dumps({"status": "synthetic", "time_fit": fit.to_dict(), "sync_offset_ms": 0}, indent=2))
     print(f"Wrote {folder}: {n_frames} frames, {n_csi} CSI frames, true offset {offset_ms:+.0f} ms")
 

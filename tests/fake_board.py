@@ -3,7 +3,8 @@
 The board serves the read-only API and a GET /csi stream of V8 frames at about
 100 per second. Frames are released in bursts and its clock runs fast, like the
 real link. A second /csi request gets HTTP 409. Frames are built with the
-struct definitions from tools/lib/csi_io.py.
+struct definitions from tools/lib/csi_io.py. PATCH /sensing accepts only a
+detector switch, and is refused (409) while /csi is open, like the real board.
 """
 
 import json
@@ -65,6 +66,7 @@ class FakeBoard:
         self.csi_sessions = 0
         self.requests = []       # (method, path) of every request
         self.true_times = []     # (device ticks, true PC ns) of every frame sent
+        self.detection = {"detector": "high_accuracy", "threshold": 0.5, "motion_on_hits": 4, "motion_off_hits": 3}
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.server.daemon_threads = True
         self.port = self.server.server_address[1]
@@ -88,7 +90,9 @@ class FakeBoard:
         if name == "device":
             return {"device_id": "000010b41de8ec00", "name": "fake", "frontend": "native", "firmware": "3.1.0", "chip": "esp32s3"}
         if name == "sensing":
-            return {"enabled": True, "mode": "csi_collection" if self.csi_open else "sensing", "traffic_generator_mode": "wifi_raw", "csi_target_pps": 100}
+            return {"enabled": True, "ready": not self.csi_open, "calibrating": False,
+                    "mode": "csi_collection" if self.csi_open else "sensing",
+                    "traffic_generator_mode": "wifi_raw", "csi_target_pps": 100, **self.detection}
         if name == "wifi":
             return {"connected": True, "channel": 6, "rssi_dbm": -50}
         return None
@@ -149,7 +153,21 @@ class FakeBoard:
                 board.requests.append((self.command, self.path))
                 self._json(405, {"code": "method_not_allowed"})
 
-            do_POST = do_PUT = do_PATCH = do_DELETE = _reject
+            do_POST = do_PUT = do_DELETE = _reject
+
+            def do_PATCH(self):
+                """Only the detector switch is supported, as the recorder sends nothing else."""
+                board.requests.append((self.command, self.path))
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length)) if length else {}
+                if self.path.split("?")[0] != "/espectre/v1/sensing":
+                    return self._json(405, {"code": "method_not_allowed"})
+                if board.csi_open:
+                    return self._json(409, {"code": "busy_raw_collection"})
+                if set(body) != {"detector"} or body["detector"] not in ("lightweight", "high_accuracy"):
+                    return self._json(400, {"code": "invalid_params"})
+                board.detection["detector"] = body["detector"]
+                return self._json(200, board.resource("sensing"))
 
             def do_GET(self):
                 board.requests.append((self.command, self.path))

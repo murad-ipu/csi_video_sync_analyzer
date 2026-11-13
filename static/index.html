@@ -14,6 +14,7 @@
     <span><b>CSI</b> <output id="infoCsi">--</output></span>
     <span><b>Difference</b> <output id="infoDelta">--</output></span>
     <span><b>RSSI</b> <output id="infoRssi">--</output></span>
+    <span title="ESPectre detectors replayed offline on this recording: state and score at the current CSI frame"><b>ESPectre</b> <output id="infoEspectre">--</output></span>
     <span id="infoStatus"></span>
   </header>
 
@@ -42,6 +43,11 @@
         <div class="chart" id="chartMotion"></div>
         <div class="title"><span>RSSI (dBm)</span><output id="hoverRssi"></output></div>
         <div class="chart" id="chartRssi"></div>
+      </div>
+      <div class="panel" id="panelEspectre">
+        <div class="title"><span>ESPectre detectors, replayed offline (score, threshold, state strip)</span><output id="hoverEspectre"></output></div>
+        <div class="legend" id="espLegend"></div>
+        <div class="chart" id="chartEspectre"></div>
       </div>
 
       <div id="freqControls" hidden>
@@ -109,6 +115,7 @@
     </label>
     <label id="normalizedLabel"><input id="normalized" type="checkbox" checked> Normalize per frame</label>
     <label><input id="detailsToggle" type="checkbox"> CSI details</label>
+    <label id="espectreLabel" title="Show or hide the ESPectre detector panel in Time mode"><input id="espectreToggle" type="checkbox" checked> ESPectre</label>
     <label class="sync">Sync offset
       <input id="offset" type="range" min="-500" max="500" step="1" value="0" aria-label="Sync offset in milliseconds">
       <output id="offsetValue">0 ms</output>
@@ -120,6 +127,7 @@
   <script src="vendor/uPlot.iife.min.js"></script>
   <script src="frequency.js"></script>
   <script src="details.js"></script>
+  <script src="espectre.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

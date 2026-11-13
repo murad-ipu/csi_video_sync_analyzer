@@ -2,9 +2,12 @@
 
     python player.py sessions/<folder>                  # opens http://localhost:8000
     python player.py sessions/<folder> --estimate-sync  # prints a suggested offset
+    python player.py sessions/<folder> --recompute     # redo the saved analysis first
 
-All CSI signals are computed once at startup and sent to the browser as binary
-arrays, so the page never waits for the server while you scrub or step.
+The player only loads results: analyze.py computes them once into
+<session>/derived/, and runs here only if they are missing or out of date.
+Everything is sent to the browser as binary arrays, so the page never waits
+for the server while you scrub or step.
 """
 
 import argparse
@@ -24,10 +27,13 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
+import analyze
+import espectre_bridge
 import espectre_path
 import frequency
 import timesync
-from frequency import MOTION_WINDOW_S, motion_signal, normalize_per_frame, select_subcarriers
+# Re-exported for the tests; the player itself loads these results from analyze.py.
+from frequency import MOTION_WINDOW_S, motion_signal, normalize_per_frame, select_subcarriers  # noqa: F401
 from record import read_json, write_json_atomic
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -59,9 +65,32 @@ def video_motion_energy(path: Path) -> np.ndarray:
 
 # --- Session loading -----------------------------------------------------------------
 
-def load_session(folder: Path, repo=None) -> dict:
-    """Read the session files and precompute everything the page displays."""
-    missing = [name for name in ("session.json", "frames.csv", "csi.npz", "video.mp4") if not (folder / name).exists()]
+def _espectre_payload(detectors: dict, t0_ns: int, arrays: dict) -> dict | None:
+    """Add the ESPectre replay arrays for the page and return their summary.
+
+    Both detectors evaluate on the same 250 ms grid, so they share one time array.
+    """
+    if not detectors:
+        return None
+    names = [name for name in espectre_bridge.DETECTORS if name in detectors]
+    first = detectors[names[0]]
+    arrays["esp_t"] = ("f8", (first["t_ns"] - t0_ns) / 1e9)
+    summary = {"detectors": {}}
+    for name in names:
+        result = detectors[name]
+        if not np.array_equal(result["t_ns"], first["t_ns"]):
+            raise SystemExit(f"ESPectre {name} evaluated on a different grid; rerun with --recompute.")
+        arrays[f"esp_{name}_score"] = ("f4", result["score"])
+        arrays[f"esp_{name}_threshold"] = ("f4", result["threshold"])
+        arrays[f"esp_{name}_state"] = ("u1", result["state"])
+        summary["detectors"][name] = result["info"]
+    return summary
+
+
+def load_session(folder: Path, repo=None, recompute: bool = False) -> dict:
+    """Load a session and its saved results (analyze.py), computing them only if needed."""
+    missing = [name for name in ("session.json", "frames.csv", "csi.npz", "csi_meta.json", "video.mp4")
+               if not (folder / name).exists()]
     if missing:
         hint = ""
         if (folder / "csi_stream.bin").exists() or (folder / "video.part.mp4").exists():
@@ -72,23 +101,28 @@ def load_session(folder: Path, repo=None) -> dict:
     from tools.lib.csi_io import load_npz_arrays  # applies the clone's subcarrier layout check
 
     session = read_json(folder / "session.json")
-    frames = np.loadtxt(folder / "frames.csv", delimiter=",", skiprows=1, dtype=np.int64, ndmin=2)
+    frames = analyze.read_frames(folder)
     csi = load_npz_arrays(folder / "csi.npz")
     if frames.shape[0] == 0 or csi["csi_t_ns"].size == 0:
         raise SystemExit(f"{folder} has no video frames or no CSI frames to show.")
+    try:
+        manifest, computed = analyze.ensure_analysis(folder, repo, recompute)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if computed:
+        analyze.print_summary(manifest)
+    results = analyze.load_results(folder, csi)
 
     frame_t_ns, pts_us = frames[:, 1], frames[:, 3]
     csi_t_ns = np.asarray(csi["csi_t_ns"])
-    t0_ns = int(min(frame_t_ns[0], csi_t_ns[0]))
+    t0_ns = int(results["t0_ns"])
     frame_t_s = (frame_t_ns - t0_ns) / 1e9
     csi_t_s = (csi_t_ns - t0_ns) / 1e9
 
-    kept = select_subcarriers(np.asarray(csi["amplitude"]))
-    if kept.size == 0:
-        raise SystemExit(f"{folder}: every subcarrier is empty.")
-    raw = np.asarray(csi["amplitude"])[:, kept].astype(np.float32)
-    normalized = normalize_per_frame(raw).astype(np.float32)
-    motion = motion_signal(csi_t_s, normalized)
+    kept = results["kept_bins"]
+    raw = results["amplitude"][:, kept]
+    normalized = results["amp_norm"]
+    motion = results["motion"]
     rssi = np.asarray(csi["rssi_dbm"]).astype(np.float32)
 
     csi_step_s = float(np.median(np.diff(csi_t_s))) if csi_t_s.size > 1 else 0.01
@@ -104,11 +138,14 @@ def load_session(folder: Path, repo=None) -> dict:
         "chart_motion": ("f4", motion[::stride]),
         "chart_rssi": ("f4", rssi[::stride]),
     }
-    # Raw contents for the CSI details view. The page only downloads them when it is opened.
-    detail_arrays = []
-    if "csi_data" in csi:
-        arrays["csi_iq"] = ("i1", np.asarray(csi["csi_data"]))
-        detail_arrays.append("csi_iq")
+    espectre = _espectre_payload(results["detectors"], t0_ns, arrays)
+    # Contents for the CSI details view. The page only downloads them when it is opened.
+    # Amplitude and phase come from ESPectre (via analyze.py); the page never recomputes them.
+    arrays["csi_iq"] = ("i1", np.asarray(csi["csi_data"]))
+    arrays["csi_amp"] = ("f4", results["amplitude"])
+    arrays["csi_phase"] = ("f4", results["phase"])
+    arrays["mean_amplitude"] = ("f4", results["mean_amplitude"])
+    detail_arrays = ["csi_iq", "csi_amp", "csi_phase", "mean_amplitude"]
     for name, dtype in DETAIL_FIELDS.items():
         if name in csi:
             arrays[name] = (dtype, np.asarray(csi[name]))
@@ -125,7 +162,8 @@ def load_session(folder: Path, repo=None) -> dict:
         "rssi_range": [float(rssi.min()) - 2.0, float(rssi.max()) + 2.0],
         "motion_window_s": MOTION_WINDOW_S,
         "detail_arrays": detail_arrays,
-        "n_subcarriers": int(np.asarray(csi["csi_data"]).shape[1] // 2) if "csi_data" in csi else 0,
+        "n_subcarriers": int(np.asarray(csi["csi_data"]).shape[1] // 2),
+        "espectre": espectre,
         "sync_offset_ms": float(session.get("sync_offset_ms", 0)),
         "player_settings": session.get("player_settings", {}),
         "summary": {
@@ -180,6 +218,7 @@ class FrequencySettings(FrequencyRequest):
 class PlayerSettings(BaseModel):
     mode: Literal["time", "frequency", "details"]
     details_panel: bool = False  # the CSI details panel under the video
+    espectre_panel: bool = True  # the ESPectre detector panel in Time mode
     frequency: FrequencySettings
 
 
@@ -224,6 +263,7 @@ def create_app(data: dict) -> FastAPI:
             settings = {
                 "mode": body.mode,
                 "details_panel": body.details_panel,
+                "espectre_panel": body.espectre_panel,
                 "frequency": {**body.frequency.model_dump(), "bands": bands},
             }
             session["player_settings"] = settings
@@ -271,10 +311,11 @@ def main() -> None:
     parser.add_argument("--no-browser", action="store_true", help="Do not open a browser tab")
     parser.add_argument("--estimate-sync", action="store_true", help="Print a suggested sync offset and exit")
     parser.add_argument("--repo", help="Path to the ESPectre clone (default ../espectre)")
+    parser.add_argument("--recompute", action="store_true", help="Redo the saved analysis even if it is up to date")
     args = parser.parse_args()
 
-    print("Loading session and computing CSI signals...")
-    data = load_session(Path(args.session), args.repo)
+    print("Loading session...")
+    data = load_session(Path(args.session), args.repo, args.recompute)
 
     if args.estimate_sync:
         print("Decoding video to measure motion energy...")

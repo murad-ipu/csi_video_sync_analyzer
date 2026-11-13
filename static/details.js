@@ -5,7 +5,7 @@
 
 const det = {
   loaded: false, loading: false, error: "",
-  iq: null, fields: {},
+  iq: null, amp: null, phase: null, fields: {},  // amp and phase are ESPectre's values, from Python
   views: [],          // { container, full, cells, rows, fieldCells, lastKey }
   keptIndex: null,    // subcarrier bin -> column in ampNorm, or -1
 };
@@ -34,9 +34,8 @@ const DETAIL_ROWS = [
   }],
   ["channel", (i) => rawField("channel", i)],
   ["Mean amplitude", (i) => {
-    let sum = 0;
-    for (let k = 0; k < K; k++) sum += ampRaw[i * K + k];
-    return `${(sum / K).toFixed(2)} (${K} signal bins)`;
+    const mean = det.fields.mean_amplitude;
+    return mean ? `${mean[i].toFixed(2)} (${K} signal bins)` : "--";
   }],
 ];
 
@@ -55,8 +54,9 @@ async function ensureDetailsLoaded() {
   det.loading = true;
   try {
     const arrays = await Promise.all(meta.detail_arrays.map(fetchArray));
+    const special = { csi_iq: "iq", csi_amp: "amp", csi_phase: "phase" };
     meta.detail_arrays.forEach((name, n) => {
-      if (name === "csi_iq") det.iq = arrays[n]; else det.fields[name] = arrays[n];
+      if (name in special) det[special[name]] = arrays[n]; else det.fields[name] = arrays[n];
     });
     det.keptIndex = new Int32Array(meta.n_subcarriers).fill(-1);
     bins.forEach((bin, k) => { if (bin < meta.n_subcarriers) det.keptIndex[bin] = k; });
@@ -109,7 +109,8 @@ function buildDetailsView(container, full) {
   const note = document.createElement("p");
   note.className = "note";
   note.textContent = "csi_data stores each subcarrier as two int8 values, Q first, then I. "
-    + "Amplitude = √(Q² + I²). Grey rows are guard and null subcarriers, which carry no signal.";
+    + "Amplitude and phase are ESPectre's CSIPacket values for I + jQ: |I + jQ| and its angle. "
+    + "Grey rows are guard and null subcarriers, which carry no signal.";
   const status = document.createElement("p");
   status.className = "note";
   view.status = status;
@@ -126,18 +127,18 @@ function buildDetailsView(container, full) {
 function fillDetailsView(view, i) {
   view.status.hidden = true;
   DETAIL_ROWS.forEach(([, text], n) => { view.fieldCells[n].textContent = text(i); });
-  const iq = det.iq, width = meta.n_subcarriers * 2;
-  for (let bin = 0; bin < meta.n_subcarriers; bin++) {
+  const iq = det.iq, n = meta.n_subcarriers, width = n * 2;
+  for (let bin = 0; bin < n; bin++) {
     const q = iq[i * width + bin * 2], iValue = iq[i * width + bin * 2 + 1];
     const cells = view.cells[bin], k = det.keptIndex[bin];
     view.rows[bin].classList.toggle("null", k < 0);
     cells[1].textContent = String(q);
     cells[2].textContent = String(iValue);
-    cells[3].textContent = Math.hypot(q, iValue).toFixed(2);
+    cells[3].textContent = det.amp[i * n + bin].toFixed(2);
     if (view.full) {
       cells[4].textContent = k >= 0 ? ampNorm[i * K + k].toFixed(3) : "--";
-      // The complex value is I + jQ, as in ESPectre's parser.
-      cells[5].textContent = q === 0 && iValue === 0 ? "--" : Math.atan2(q, iValue).toFixed(3);
+      // A zero I/Q pair has no meaningful angle.
+      cells[5].textContent = q === 0 && iValue === 0 ? "--" : det.phase[i * n + bin].toFixed(3);
     }
   }
 }

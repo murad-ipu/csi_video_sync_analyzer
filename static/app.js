@@ -14,9 +14,10 @@ const state = {
   offsetS: 0, windowS: 10, normalized: true, renderQueued: false,
   mode: "time",         // "time", "frequency" (frequency.js) or "details" (details.js)
   detailsPanel: false,  // the CSI details panel under the video
+  espectrePanel: true,  // the ESPectre detector panel in Time mode (espectre.js)
 };
 const MODE_PANELS = {
-  time: ["panelWaterfall", "panelFrame", "panelMotion"],
+  time: ["panelWaterfall", "panelFrame", "panelMotion", "panelEspectre"],
   frequency: ["freqControls", "panelSpectrogram", "panelSpectrum", "panelBands"],
   details: ["panelDetails"],
 };
@@ -35,7 +36,7 @@ function nearest(values, v) {
   return Math.abs(values[low] - v) <= Math.abs(values[high] - v) ? low : high;
 }
 
-const ARRAY_TYPES = { f8: Float64Array, f4: Float32Array, i1: Int8Array, i8: BigInt64Array };
+const ARRAY_TYPES = { f8: Float64Array, f4: Float32Array, i1: Int8Array, i8: BigInt64Array, u1: Uint8Array };
 
 async function fetchArray(name) {
   const response = await fetch(`api/array/${name}`);
@@ -243,12 +244,14 @@ function updateChartWindows() {
   if (state.mode !== "time") return;
   const center = cursorTime();
   for (const plot of [motionPlot, rssiPlot]) plot.setScale("x", { min: center - state.windowS, max: center + state.windowS });
+  updateEspectreWindow(center);
 }
 
 function applyOffsetToCharts() {
   chartX = Float64Array.from(chartT, (t) => t + state.offsetS);
   motionPlot.setData([chartX, chartMotion], false);
   rssiPlot.setData([chartX, chartRssi], false);
+  applyEspectreOffset();
   applyFrequencyOffset();
 }
 
@@ -260,6 +263,7 @@ function resizeVisibleCharts() {
     const element = $(id);
     plot.setSize({ width: element.clientWidth, height: element.clientHeight });
   }
+  resizeEspectrePlot();
 }
 
 // --- Rendering --------------------------------------------------------------------
@@ -269,6 +273,7 @@ function updateInfo() {
   $("infoCsi").textContent = `frame ${state.csi + 1} / ${meta.n_csi} · ${csiTime.toFixed(3)} s`;
   $("infoDelta").textContent = `${((csiTime + state.offsetS - frameTime) * 1000).toFixed(1)} ms`;
   $("infoRssi").textContent = `${csiRssi[state.csi].toFixed(0)} dBm`;
+  $("infoEspectre").textContent = espectreInfoText();
   if (document.activeElement !== $("timeline")) $("timeline").value = state.frame;
 }
 
@@ -352,8 +357,11 @@ function setMode(mode, save) {
     for (const id of ids) $(id).hidden = name !== mode;
     $(`mode_${name}`).setAttribute("aria-pressed", String(name === mode));
   }
+  // The ESPectre panel also follows its own checkbox, and needs replay results.
+  $("panelEspectre").hidden = mode !== "time" || !state.espectrePanel || !esp.available;
   $("normalizedLabel").hidden = mode !== "time";  // that checkbox only affects the time panels
   $("right").dataset.mode = mode;
+  $("right").dataset.espectre = $("panelEspectre").hidden ? "off" : "on";
   resizeVisibleCharts();
   if (mode === "frequency") showFrequency();
   queueRender();
@@ -368,6 +376,13 @@ function setDetailsPanel(show, save) {
   if (save) savePlayerSettings();
 }
 
+function setEspectrePanel(show, save) {
+  state.espectrePanel = show;
+  $("espectreToggle").checked = show;
+  setMode(state.mode, false);
+  if (save) savePlayerSettings();
+}
+
 let settingsTimer = null;
 function savePlayerSettings() {
   clearTimeout(settingsTimer);
@@ -375,7 +390,9 @@ function savePlayerSettings() {
     fetch("api/player_settings", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode: state.mode, details_panel: state.detailsPanel, frequency: fq.settings }),
+      body: JSON.stringify({
+        mode: state.mode, details_panel: state.detailsPanel, espectre_panel: state.espectrePanel, frequency: fq.settings,
+      }),
     }).catch(() => {});  // settings are a convenience: playback must never depend on them
   }, 300);
 }
@@ -436,6 +453,7 @@ function bindControls() {
     $(`mode_${name}`).onclick = (event) => { event.target.blur(); setMode(name, true); };
   }
   $("detailsToggle").onchange = (event) => { event.target.blur(); setDetailsPanel(event.target.checked, true); };
+  $("espectreToggle").onchange = (event) => { event.target.blur(); setEspectrePanel(event.target.checked, true); };
 
   document.addEventListener("keydown", (event) => {
     const handlers = {
@@ -464,6 +482,7 @@ async function start() {
   [frameT, framePts, csiT, csiRssi, ampRaw, ampNorm, chartT, chartMotion, chartRssi] = await Promise.all(
     ["frame_t", "frame_pts", "csi_t", "csi_rssi", "amp_raw", "amp_norm", "chart_t", "chart_motion", "chart_rssi"].map(fetchArray),
   );
+  await loadEspectre();
   bins = meta.kept_bins;
   K = bins.length;
   state.offsetS = meta.sync_offset_ms / 1000;
@@ -471,12 +490,15 @@ async function start() {
 
   motionPlot = makeChart($("chartMotion"), chartMotion, [0, meta.motion_max], "hoverMotion", 4);
   rssiPlot = makeChart($("chartRssi"), chartRssi, meta.rssi_range, "hoverRssi", 0);
+  initEspectre();
   bindControls();
   setOffset(meta.sync_offset_ms, false);
   initFrequency();
   initDetails();
   const saved = meta.player_settings || {};
   setDetailsPanel(saved.details_panel === true, false);
+  state.espectrePanel = saved.espectre_panel !== false;
+  $("espectreToggle").checked = state.espectrePanel;
   setMode(saved.mode in MODE_PANELS ? saved.mode : "time", false);
 
   const fit = meta.summary.fit_ok ? `clock fit residual ${meta.summary.fit_residual_rms_ms.toFixed(2)} ms` : "clock fit unreliable";

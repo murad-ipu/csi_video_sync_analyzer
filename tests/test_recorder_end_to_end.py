@@ -60,6 +60,7 @@ def test_board_is_released_and_only_get_requests_were_sent(recording):
             break
         deadline.wait(0.1)
     assert not board.csi_open, "the /csi connection should be closed"
+    # Without the D key nothing but GET is ever sent.
     assert {method for method, _ in board.requests} == {"GET"}
 
 
@@ -126,6 +127,63 @@ def test_meta_and_diagnostics_contents(recording):
     assert rows[-1]["csi_accepted_pps"] == "100.0"
     assert rows[-1]["raw_csi_active"] == "True"
     assert rows[-1]["csi_stale_total"] == "", "missing fields stay empty"
+
+
+def test_csi_npz_holds_espectre_values_and_the_board_rate(recording):
+    _, folder, _ = recording
+    data = np.load(folder / "csi.npz")
+    assert data["phase"].shape == data["amplitude"].shape
+    assert int(data["csi_target_pps"]) == 100
+    q, i = float(data["csi_data"][0, 40]), float(data["csi_data"][0, 41])
+    assert data["phase"][0, 20] == pytest.approx(np.arctan2(q, i), abs=1e-6)
+
+
+def test_the_session_is_analyzed_when_recording_ends(recording):
+    _, folder, _ = recording
+    manifest = json.loads((folder / "derived" / "manifest.json").read_text())
+    assert {"player_signals.npz", "espectre_lightweight.npz", "espectre_high_accuracy.npz"} <= set(manifest["files"])
+    assert manifest["detectors"]["high_accuracy"]["board_detector"] == "high_accuracy"
+    meta = json.loads((folder / "csi_meta.json").read_text())
+    assert meta["sensing"]["detector"] == "high_accuracy"
+
+
+def wait_for(condition, seconds=5.0):
+    event = threading.Event()
+    for _ in range(int(seconds / 0.05)):
+        if condition():
+            return True
+        event.wait(0.05)
+    return False
+
+
+def test_detector_switch_sends_one_patch_and_shows_the_new_detector(tmp_path):
+    with FakeBoard() as board:
+        recorder = record.Recorder(recorder_args(board, tmp_path), camera_factory)
+        recorder.start_preview()
+        try:
+            assert "high_accuracy" in recorder.detector_line()
+            assert recorder.switch_detector()
+            assert wait_for(lambda: recorder.switch_thread is None)
+            assert board.detection["detector"] == "lightweight"
+            assert recorder.board_info["sensing"]["detector"] == "lightweight"
+            assert "lightweight" in recorder.detector_line()
+            patches = [request for request in board.requests if request[0] != "GET"]
+            assert patches == [("PATCH", "/espectre/v1/sensing")]
+        finally:
+            recorder.close()
+
+
+def test_detector_switch_is_refused_while_recording(tmp_path):
+    with FakeBoard() as board:
+        recorder = record.Recorder(recorder_args(board, tmp_path), camera_factory)
+        recorder.start_preview()
+        try:
+            recorder.recording.set()
+            assert not recorder.switch_detector()
+            recorder.recording.clear()
+        finally:
+            recorder.close()
+        assert all(method == "GET" for method, _ in board.requests)
 
 
 def test_second_session_gets_a_clear_error_when_board_is_busy(tmp_path):

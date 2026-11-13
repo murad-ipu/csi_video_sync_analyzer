@@ -3,8 +3,10 @@
     python record.py --target <IP> --camera 0 --duration 300 --out sessions/
     python record.py --recover sessions/<folder>      # finish a crashed session
 
-Press S in the preview window to start and Q to stop. Only GET requests are
-sent to the board, so its settings and traffic source never change.
+Press S in the preview window to start and Q to stop. D (preview only) switches
+the board between its Lightweight and High-Accuracy detectors with one
+PATCH /sensing; apart from that only GET requests are sent to the board.
+At the end, analyze.py computes the derived results into <session>/derived/.
 
 Crash safety: while recording, CSI goes to an append-only csi_stream.bin and
 video to a fragmented video.part.mp4. A clean stop (or --recover) converts them
@@ -28,6 +30,8 @@ import av
 import cv2
 import numpy as np
 
+import analyze
+import espectre_bridge
 import espectre_path
 import timesync
 
@@ -206,9 +210,13 @@ def finalize_session(folder: Path, status: str = "complete", repo=None) -> dict:
         fit = timesync.fit_device_to_pc(records["device_ticks_us"].astype(np.int64), records["pc_receive_t_ns"])
         # Uses the clone's layout check so subcarrier order stays correct for any chip.
         iq = normalize_stored_csi_bin_layout(np.array(records["iq"]))
-        # Amplitude is the length of each (Q, I) pair.
-        pairs = iq.reshape(iq.shape[0], -1, 2).astype(np.float32)
-        amplitude = np.hypot(pairs[..., 0], pairs[..., 1])
+        # Amplitude and phase come from ESPectre's CSIPacket (complex value I + jQ).
+        amplitude, phase = espectre_bridge.amplitude_phase(iq)
+        # ESPectre datasets store the board's packet rate, so its replay uses it.
+        extra = {}
+        target_pps = meta.get("sensing", {}).get("csi_target_pps")
+        if target_pps:
+            extra["csi_target_pps"] = np.int64(target_pps)
         temp = folder / "csi.tmp.npz"
         with open(temp, "wb") as file:
             np.savez(
@@ -225,10 +233,13 @@ def finalize_session(folder: Path, status: str = "complete", repo=None) -> dict:
                 channel=records["channel"],
                 csi_data=iq,  # int8 pairs, Q first then I, as in the V8 payload
                 amplitude=amplitude,
+                phase=phase,
+                **extra,
             )
         os.replace(temp, folder / "csi.npz")
         meta["subcarrier_count"] = int(amplitude.shape[1])
         meta["iq_order"] = "csi_data holds int8 pairs: Q first, then I"
+        meta["derived_values"] = "amplitude and phase (radians) of I + jQ, from ESPectre's CSIPacket"
         write_json_atomic(folder / "csi_meta.json", meta)
 
     # Video: make it browser-friendly and keep frames.csv in step with it.
@@ -319,6 +330,20 @@ def print_summary(folder: Path, session: dict) -> None:
         print("  WARNING: the clock fit is not reliable (recording too short, or implausible drift).")
 
 
+def analyze_finished_session(folder: Path, repo=None) -> dict | None:
+    """Run analyze.py on a finished session. A failure never costs the recording."""
+    if not (folder / "csi.npz").exists() or not (folder / "frames.csv").exists():
+        return None
+    try:
+        manifest = analyze.run_analysis(folder, repo)
+    except Exception as exc:
+        print(f"Warning: analysis failed ({type(exc).__name__}: {exc}). "
+              f"The recording is intact; retry with: python analyze.py {folder}")
+        return None
+    analyze.print_summary(manifest)
+    return manifest
+
+
 # --- Recorder -------------------------------------------------------------------------
 
 def open_webcam(index: int, width: int, height: int, fps: float):
@@ -381,13 +406,23 @@ class Recorder:
         self.diagnostics_file = None
         self.diagnostics_writer = None
         self.diagnostics_lock = threading.Lock()
+        # One request at a time on the board connection (diagnostics thread and detector switch).
+        self.client_lock = threading.Lock()
+        self.sensing_lock = threading.Lock()  # a /sensing refresh and a detector switch never overlap
+        self.board_info = {}
+        self.switch_thread = None
+        self.switch_status = ""
+
+    def request(self, method: str, resource: str, data: dict | None = None, timeout: float | None = None) -> dict:
+        with self.client_lock:
+            return self.client.request(method, resource, data, timeout=timeout)
 
     # Startup ---------------------------------------------------------------------------
 
     def read_board_info(self) -> dict:
         """Read everything needed for csi_meta.json before /csi is opened."""
         try:
-            info = {name: self.client.request("get", name) for name in ("device", "capabilities", "sensing", "wifi")}
+            info = {name: self.request("get", name) for name in ("device", "capabilities", "sensing", "wifi")}
         except Exception as exc:
             raise SystemExit(f"Cannot reach the board at {self.args.target}: {exc}")
         if not info["sensing"].get("enabled", True):
@@ -525,7 +560,7 @@ class Recorder:
     def _diagnostic_field_names(self) -> list:
         """Ask only for fields this firmware lists: an unknown name fails the request."""
         try:
-            catalog = self.client.request("get", "diagnostics", {"fields": []}, timeout=2.0)
+            catalog = self.request("get", "diagnostics", {"fields": []}, timeout=2.0)
             names = {item.get("name") for item in catalog.get("fields", []) if isinstance(item, dict)}
         except Exception:
             return ["*"]
@@ -543,7 +578,12 @@ class Recorder:
             next_poll += 1.0
             pc_t_ns = time.time_ns()
             try:
-                values = self.client.request("get", "diagnostics", {"fields": fields}, timeout=2.0)
+                values = self.request("get", "diagnostics", {"fields": fields}, timeout=2.0)
+                # In preview, keep the board's detector and calibration state current.
+                # The lock stops a reading taken before a switch from overwriting its result.
+                with self.sensing_lock:
+                    if not self.recording.is_set() and self.switch_thread is None:
+                        self.board_info["sensing"] = self.request("get", "sensing", timeout=2.0)
             except Exception as exc:
                 self.diagnostics_status = f"error: {exc}"
                 continue
@@ -559,9 +599,55 @@ class Recorder:
                     )
                     self.diagnostics_file.flush()
 
+    # Detector switch (preview only) ------------------------------------------------------
+
+    def switch_detector(self) -> bool:
+        """Ask the board to switch between its two detectors. Returns False if not allowed now.
+
+        This PATCH /sensing is the only request the recorder sends that is not a
+        GET, and only when the user presses D before recording. During a /csi
+        session the board would refuse it (409) and runs no detector anyway.
+        """
+        if self.recording.is_set() or self.switch_thread is not None:
+            return False
+        current = self.board_info.get("sensing", {}).get("detector")
+        target = "high_accuracy" if current == "lightweight" else "lightweight"
+        self.switch_status = f"switching to {target}..."
+        self.switch_thread = threading.Thread(target=self._switch, args=(target,), name="switch", daemon=True)
+        self.switch_thread.start()
+        return True
+
+    def _switch(self, target: str) -> None:
+        with self.sensing_lock:
+            try:
+                self.request("patch", "sensing", {"detector": target}, timeout=5.0)
+                self.board_info["sensing"] = self.request("get", "sensing", timeout=3.0)
+                self.switch_status = ""
+            except Exception as exc:
+                self.switch_status = f"switch failed: {exc}"
+            finally:
+                self.switch_thread = None
+
+    def detector_line(self) -> str:
+        sensing = self.board_info.get("sensing", {})
+        threshold = sensing.get("threshold")
+        threshold_text = f"{threshold:.2f}" if isinstance(threshold, (int, float)) else "--"
+        state = self.switch_status or ("calibrating" if sensing.get("calibrating") else
+                                       "ready" if sensing.get("ready") else "not ready")
+        return (f"Detector {sensing.get('detector', '--')}   threshold {threshold_text}   "
+                f"hits {sensing.get('motion_on_hits', '--')}/{sensing.get('motion_off_hits', '--')}   "
+                f"[{state}]   D = switch")
+
     # Recording -------------------------------------------------------------------------
 
     def begin_recording(self) -> None:
+        if self.switch_thread is not None:
+            raise RuntimeError("the board is still switching detector; try again in a moment")
+        # Read /sensing again so csi_meta.json holds the settings in force right now.
+        try:
+            self.board_info["sensing"] = self.request("get", "sensing", timeout=3.0)
+        except Exception as exc:
+            raise RuntimeError(f"cannot read /sensing: {exc}") from exc
         # Open /csi first: if the board refuses, nothing has been created on disk.
         self.receiver.add_callback(self._on_csi_packet)
         try:
@@ -632,7 +718,10 @@ class Recorder:
             },
         })
         write_json_atomic(self.session_dir / "session.json", session)
-        return finalize_session(self.session_dir, repo=self.args.repo)
+        session = finalize_session(self.session_dir, repo=self.args.repo)
+        print("Analyzing the session (amplitudes, motion, ESPectre detectors)...")
+        analyze_finished_session(self.session_dir, self.args.repo)
+        return session
 
     def close(self) -> None:
         self.quit.set()
@@ -684,6 +773,7 @@ class Recorder:
             f"Video {self.video_fps():5.1f} fps   {self.camera_settings['actual']['width']}x{self.camera_settings['actual']['height']}",
             f"Board  CSI {diagnostics.get('csi_accepted_pps', '--')}/s   occupancy {occupancy_text}   "
             f"RSSI {diagnostics.get('wifi_rssi_dbm', '--')}   [{self.diagnostics_status[:40]}]",
+            self.detector_line()[:90],
         ]
 
 
@@ -729,6 +819,9 @@ def run_recorder(args, camera_factory=open_webcam):
                     break
                 if recorder.camera_error:
                     raise SystemExit(f"Camera error: {recorder.camera_error}")
+                if key in (ord("d"), ord("D")):
+                    message = "" if recorder.switch_detector() else "Wait for the current switch to finish"
+                    continue
                 if key in (ord("s"), ord("S")) or start_requested:
                     start_requested = False
                     try:
@@ -797,6 +890,8 @@ def main() -> None:
     if args.recover:
         folder = Path(args.recover)
         print_summary(folder, finalize_session(folder, status="recovered", repo=args.repo))
+        print("Analyzing the session (amplitudes, motion, ESPectre detectors)...")
+        analyze_finished_session(folder, args.repo)
         return
     if sys.version_info < (3, 13) and sys.platform == "win32":
         print("Note: before Python 3.13, time.time_ns() on Windows only ticks about every 15 ms.")

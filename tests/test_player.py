@@ -85,6 +85,44 @@ def test_details_arrays_match_csi_npz_exactly(client, session):
         assert (values == stored[name].astype(np.int64)).all()
 
 
+def test_details_amplitude_and_phase_are_espectre_values_from_python(client, session):
+    folder, _ = session
+    meta = client.get("/api/meta").json()
+    for name in ("csi_amp", "csi_phase", "mean_amplitude"):
+        assert name in meta["detail_arrays"]
+    iq = np.load(folder / "csi.npz")["csi_data"]
+    amplitude = np.frombuffer(client.get("/api/array/csi_amp").content, "<f4").reshape(meta["n_csi"], 64)
+    phase = np.frombuffer(client.get("/api/array/csi_phase").content, "<f4").reshape(meta["n_csi"], 64)
+    q, i = iq[:, 0::2].astype(np.float32), iq[:, 1::2].astype(np.float32)
+    assert np.allclose(amplitude, np.hypot(q, i), atol=1e-5)
+    assert np.allclose(phase, np.arctan2(q, i), atol=1e-6)
+    mean = np.frombuffer(client.get("/api/array/mean_amplitude").content, "<f4")
+    assert np.allclose(mean, amplitude[:, meta["kept_bins"]].mean(axis=1), rtol=1e-5)
+
+
+def test_espectre_arrays_share_one_time_grid(client):
+    meta = client.get("/api/meta").json()
+    detectors = meta["espectre"]["detectors"]
+    assert set(detectors) == {"lightweight", "high_accuracy"}
+    t = np.frombuffer(client.get("/api/array/esp_t").content, "<f8")
+    assert t.size == detectors["high_accuracy"]["n_evaluations"] > 0
+    for name in detectors:
+        assert meta["arrays"][f"esp_{name}_state"] == "u1"
+        assert np.frombuffer(client.get(f"/api/array/esp_{name}_score").content, "<f4").size == t.size
+        assert np.frombuffer(client.get(f"/api/array/esp_{name}_threshold").content, "<f4").size == t.size
+        assert np.frombuffer(client.get(f"/api/array/esp_{name}_state").content, "u1").size == t.size
+
+
+def test_espectre_panel_setting_is_saved(client, session):
+    folder, _ = session
+    settings = {"window_s": 2.0, "hop_s": 0.1, "method": "mean", "freq_max_hz": 50,
+                "color_auto": True, "color_min": -60, "color_max": 0}
+    client.post("/api/player_settings", json={"mode": "time", "espectre_panel": False, "frequency": settings})
+    assert json.loads((folder / "session.json").read_text())["player_settings"]["espectre_panel"] is False
+    client.post("/api/player_settings", json={"mode": "time", "frequency": settings})
+    assert json.loads((folder / "session.json").read_text())["player_settings"]["espectre_panel"] is True
+
+
 def test_details_mode_and_panel_are_saved(client, session):
     folder, _ = session
     settings = {"window_s": 2.0, "hop_s": 0.1, "method": "motion", "freq_max_hz": 5,

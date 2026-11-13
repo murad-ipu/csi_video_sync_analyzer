@@ -1,7 +1,8 @@
 """Find the ESPectre clone and make tools/lib/csi_io.py importable.
 
-Nothing ESPectre-specific is copied into this project: the V8 parser and the
-Direct HTTP client are always imported from the clone.
+Nothing ESPectre-specific is copied into this project: the V8 parser, the
+Direct HTTP client, and every calculation in espectre_bridge.py are always
+imported from the clone.
 """
 
 import os
@@ -25,4 +26,8 @@ def setup(repo=None) -> Path:
     for path in (str(root / "src" / "python"), str(root)):
         if path not in sys.path:
             sys.path.insert(0, path)
+    # ESPectre's own bootstrap adds the rest (for `config`, `detector_interface`, ...),
+    # exactly as its tools do.
+    from tools.lib.bootstrap import setup_paths
+    setup_paths()
     return root
