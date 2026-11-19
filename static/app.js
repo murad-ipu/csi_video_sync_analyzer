@@ -12,7 +12,7 @@ const state = {
   pinnedCsi: null,      // set by Shift+arrow so CSI stays put while the video seeks
   pendingFrame: null,   // target of a seek in progress, so quick arrow presses add up
   offsetS: 0, windowS: 10, normalized: true, renderQueued: false,
-  mode: "time",         // "time", "frequency" (frequency.js) or "details" (details.js)
+  mode: "time",         // "time", "frequency" (frequency.js), "details" (details.js) or "presence" (presence.js)
   detailsPanel: false,  // the CSI details panel under the video
   espectrePanel: true,  // the ESPectre detector panel in Time mode (espectre.js)
 };
@@ -20,6 +20,7 @@ const MODE_PANELS = {
   time: ["panelWaterfall", "panelFrame", "panelMotion", "panelEspectre"],
   frequency: ["freqControls", "panelSpectrogram", "panelSpectrum", "panelBands"],
   details: ["panelDetails"],
+  presence: ["presenceControls", "panelBreathing", "panelShape", "panelLevel"],
 };
 let meta, frameT, framePts, csiT, csiRssi, ampRaw, ampNorm, chartT, chartMotion, chartRssi, chartX;
 let bins, K, motionPlot, rssiPlot;
@@ -241,6 +242,7 @@ function makeChart(element, values, range, hoverId, digits) {
 
 function updateChartWindows() {
   if (state.mode === "frequency") { updateBandWindow(); return; }
+  if (state.mode === "presence") { updatePresence(); return; }
   if (state.mode !== "time") return;
   const center = cursorTime();
   for (const plot of [motionPlot, rssiPlot]) plot.setScale("x", { min: center - state.windowS, max: center + state.windowS });
@@ -253,11 +255,13 @@ function applyOffsetToCharts() {
   rssiPlot.setData([chartX, chartRssi], false);
   applyEspectreOffset();
   applyFrequencyOffset();
+  applyPresenceOffset();
 }
 
 // A hidden chart measures zero, so only the charts on screen can be resized.
 function resizeVisibleCharts() {
   if (state.mode === "frequency") { resizeBandPlot(); return; }
+  if (state.mode === "presence") { resizePresencePlots(); return; }
   if (state.mode !== "time") return;
   for (const [plot, id] of [[motionPlot, "chartMotion"], [rssiPlot, "chartRssi"]]) {
     const element = $(id);
@@ -364,6 +368,7 @@ function setMode(mode, save) {
   $("right").dataset.espectre = $("panelEspectre").hidden ? "off" : "on";
   resizeVisibleCharts();
   if (mode === "frequency") showFrequency();
+  if (mode === "presence") showPresence();
   queueRender();
   if (save) savePlayerSettings();
 }
@@ -495,6 +500,7 @@ async function start() {
   setOffset(meta.sync_offset_ms, false);
   initFrequency();
   initDetails();
+  initPresence();
   const saved = meta.player_settings || {};
   setDetailsPanel(saved.details_panel === true, false);
   state.espectrePanel = saved.espectre_panel !== false;

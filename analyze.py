@@ -12,6 +12,7 @@ Files written:
   derived/player_signals.npz         subcarriers kept, normalized amplitude, motion, mean amplitude
   derived/espectre_lightweight.npz   ESPectre Lightweight replay, one row per evaluation
   derived/espectre_high_accuracy.npz ESPectre High-Accuracy replay, one row per evaluation
+  derived/presence.npz               presence evidence: breathing share, channel shape, motion level
   derived/manifest.json              what the results were computed from
   frequency_cache/<key>.npz          the Frequency view for the page's first settings
 
@@ -27,6 +28,7 @@ import json
 import os
 import subprocess
 import time
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
@@ -124,6 +126,8 @@ def fingerprint(folder: Path, repo=None) -> dict:
                 "min_nonzero_fraction": frequency.MIN_NONZERO_FRACTION,
                 "motion_window_s": frequency.MOTION_WINDOW_S,
             },
+            # Through JSON once, so tuples become lists exactly as they read back from the manifest.
+            "presence": json.loads(json.dumps(asdict(frequency.PresenceParams()))),
             "espectre": espectre_bridge.espectre_parameters(),
         },
     }
@@ -228,6 +232,18 @@ def run_analysis(folder: Path, repo=None, log=print) -> dict:
     except ValueError as exc:
         log(f"  frequency view skipped: {exc}")
     timings["frequency_s"] = time.perf_counter() - step
+
+    # 5. Presence evidence (this app's own math, in frequency.py).
+    log("  presence evidence (breathing share, channel shape, motion level)...")
+    step = time.perf_counter()
+    presence = frequency.compute_presence(csi_t_s, normalized, motion)
+    _write_npz(
+        derived / "presence.npz", t=presence["t"], breathing_share=presence["breathing_share"],
+        breathing_hz=presence["breathing_hz"], shape=presence["shape"], level=presence["level"],
+        info=json.dumps(presence["info"]),
+    )
+    files.append("presence.npz")
+    timings["presence_s"] = time.perf_counter() - step
     timings["total_s"] = time.perf_counter() - started
 
     app_commit = _git(ROOT, "rev-parse", "HEAD")
@@ -272,7 +288,13 @@ def load_results(folder: Path, csi) -> dict:
             with np.load(derived / file_name) as stored:
                 detectors[name] = {key: stored[key] for key in stored.files if key != "info"}
                 detectors[name]["info"] = json.loads(str(stored["info"]))
-    return {"manifest": manifest, "amplitude": amplitude, "phase": phase, **signals, "detectors": detectors}
+    presence = None
+    if "presence.npz" in manifest["files"]:
+        with np.load(derived / "presence.npz") as stored:
+            presence = {key: stored[key] for key in stored.files if key != "info"}
+            presence["info"] = json.loads(str(stored["info"]))
+    return {"manifest": manifest, "amplitude": amplitude, "phase": phase, **signals, "detectors": detectors,
+            "presence": presence}
 
 
 def print_summary(manifest: dict) -> None:

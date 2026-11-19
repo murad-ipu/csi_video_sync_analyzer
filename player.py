@@ -139,6 +139,13 @@ def load_session(folder: Path, repo=None, recompute: bool = False) -> dict:
         "chart_rssi": ("f4", rssi[::stride]),
     }
     espectre = _espectre_payload(results["detectors"], t0_ns, arrays)
+    presence = results["presence"]
+    if presence is not None:
+        # Times are CSI time like every cached result; the page adds the sync offset.
+        arrays["pres_t"] = ("f8", presence["t"])
+        arrays["pres_breathing"] = ("f4", presence["breathing_share"])
+        arrays["pres_breathing_hz"] = ("f4", presence["breathing_hz"])
+        arrays["pres_level"] = ("f4", presence["level"])
     # Contents for the CSI details view. The page only downloads them when it is opened.
     # Amplitude and phase come from ESPectre (via analyze.py); the page never recomputes them.
     arrays["csi_iq"] = ("i1", np.asarray(csi["csi_data"]))
@@ -164,6 +171,7 @@ def load_session(folder: Path, repo=None, recompute: bool = False) -> dict:
         "detail_arrays": detail_arrays,
         "n_subcarriers": int(np.asarray(csi["csi_data"]).shape[1] // 2),
         "espectre": espectre,
+        "presence": presence["info"] if presence is not None else None,
         "sync_offset_ms": float(session.get("sync_offset_ms", 0)),
         "player_settings": session.get("player_settings", {}),
         "summary": {
@@ -175,7 +183,7 @@ def load_session(folder: Path, repo=None, recompute: bool = False) -> dict:
     }
     return {
         "folder": folder, "meta": meta, "payloads": payloads, "frame_t_s": frame_t_s,
-        "csi_t_s": csi_t_s, "normalized": normalized,
+        "csi_t_s": csi_t_s, "normalized": normalized, "presence": presence,
     }
 
 
@@ -215,8 +223,14 @@ class FrequencySettings(FrequencyRequest):
     color_max: float = Field(ge=-400, le=400, allow_inf_nan=False)
 
 
+class PresenceBaseline(BaseModel):
+    """An empty-room stretch in CSI time (no sync offset). Both None clears it."""
+    start_s: float | None = Field(default=None, ge=-1e6, le=1e6, allow_inf_nan=False)
+    end_s: float | None = Field(default=None, ge=-1e6, le=1e6, allow_inf_nan=False)
+
+
 class PlayerSettings(BaseModel):
-    mode: Literal["time", "frequency", "details"]
+    mode: Literal["time", "frequency", "details", "presence"]
     details_panel: bool = False  # the CSI details panel under the video
     espectre_panel: bool = True  # the ESPectre detector panel in Time mode
     frequency: FrequencySettings
@@ -225,6 +239,16 @@ class PlayerSettings(BaseModel):
 def create_app(data: dict) -> FastAPI:
     app = FastAPI(title="CSI video player", docs_url=None, redoc_url=None, openapi_url=None)
     folder, meta, payloads = data["folder"], data["meta"], data["payloads"]
+
+    @app.middleware("http")
+    async def check_page_files_every_time(request, call_next):
+        # Without this, a browser may keep using an old copy of the page after an update.
+        # "no-cache" still lets it reuse its copy, but only after the server confirms it is
+        # current (a cheap 304 reply). The video is left alone: it never changes.
+        response = await call_next(request)
+        if request.url.path != "/video.mp4":
+            response.headers["Cache-Control"] = "no-cache"
+        return response
     write_lock = threading.Lock()
     compute_lock = threading.Lock()  # a second request for the same result then finds it cached
     amplitude = np.frombuffer(payloads["amp_raw"], dtype="f4").reshape(meta["n_csi"], len(meta["kept_bins"]))
@@ -266,10 +290,51 @@ def create_app(data: dict) -> FastAPI:
                 "espectre_panel": body.espectre_panel,
                 "frequency": {**body.frequency.model_dump(), "bands": bands},
             }
+            # The presence baseline has its own endpoint, so keep it as it is.
+            if "presence" in session.get("player_settings", {}):
+                settings["presence"] = session["player_settings"]["presence"]
             session["player_settings"] = settings
             write_json_atomic(folder / "session.json", session)
             meta["player_settings"] = settings
         return settings
+
+    def presence_response(baseline) -> dict:
+        """The saved baseline and every point's comparison with it."""
+        presence = data["presence"]
+        if presence is None:
+            raise HTTPException(404, "This session has no presence results; rerun with --recompute.")
+        if not baseline:
+            return {"baseline": None, "distance": None, "level_floor": None}
+        start_s, end_s = baseline
+        try:
+            result = frequency.presence_baseline(presence["t"], presence["shape"], presence["level"], start_s, end_s)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        # JSON has no NaN: points without a full window become null.
+        distance = [None if not np.isfinite(v) else round(float(v), 4) for v in result["distance"]]
+        return {"baseline": [start_s, end_s], "distance": distance, "level_floor": result["level_floor"]}
+
+    @app.get("/api/presence/baseline")
+    def get_presence_baseline():
+        with write_lock:
+            saved = read_json(folder / "session.json").get("player_settings", {}).get("presence", {})
+        return presence_response(saved.get("baseline"))
+
+    @app.post("/api/presence/baseline")
+    def set_presence_baseline(body: PresenceBaseline):
+        if (body.start_s is None) != (body.end_s is None):
+            raise HTTPException(422, "Give both start_s and end_s, or neither to clear the baseline.")
+        baseline = None if body.start_s is None else [body.start_s, body.end_s]
+        if baseline and baseline[1] <= baseline[0]:
+            raise HTTPException(422, "end_s must be after start_s.")
+        response = presence_response(baseline)  # checked before anything is saved
+        with write_lock:
+            session = read_json(folder / "session.json")
+            settings = session.setdefault("player_settings", {})
+            settings["presence"] = {"baseline": baseline}
+            write_json_atomic(folder / "session.json", session)
+            meta["player_settings"] = settings
+        return response
 
     @app.post("/api/frequency")
     def compute_frequency(body: FrequencyRequest):

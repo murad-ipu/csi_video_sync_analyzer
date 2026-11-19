@@ -90,6 +90,23 @@
         <div class="legend" id="bandLegend"></div>
         <div class="chart" id="chartBands"></div>
       </div>
+      <div id="presenceControls" hidden>
+        <button id="presBaselineSet">Use 30 s around the cursor as empty baseline</button>
+        <button id="presBaselineClear">Clear baseline</button>
+        <output id="presStatus" role="status"></output>
+      </div>
+      <div class="panel" id="panelBreathing" hidden>
+        <div class="title"><span title="Share of the slow (0.05-2 Hz) fluctuation held by one narrow peak at 9-30 per minute, over 30 s">Breathing peak share, 30 s window · <span id="breathingNote"></span></span><output id="hoverBreathing"></output></div>
+        <div class="chart" id="chartBreathing"></div>
+      </div>
+      <div class="panel" id="panelShape" hidden>
+        <div class="title"><span title="How different the average amplitude pattern across subcarriers is from the empty baseline">Channel shape change from the empty baseline, 10 s average (%)</span><output id="hoverShape"></output></div>
+        <div class="chart" id="chartShape"></div>
+      </div>
+      <div class="panel" id="panelLevel" hidden>
+        <div class="title"><span title="Median of the motion signal over 10 s: the steady background level, ignoring short bursts">Micro-motion level, median over 10 s (log scale) · <span id="levelNote"></span></span><output id="hoverLevel"></output></div>
+        <div class="chart" id="chartLevel"></div>
+      </div>
       <div class="panel" id="panelDetails" hidden>
         <div class="title"><span>CSI frame contents (csi.npz), for the CSI frame matched to the video</span></div>
         <div class="detailsView" id="detailsMain"></div>
@@ -100,7 +117,7 @@
   <footer id="controls">
     <button id="play" title="Space">Play</button>
     <div class="mode" role="group" aria-label="View">
-      <button id="mode_time" aria-pressed="true">Time</button><button id="mode_frequency" aria-pressed="false">Frequency</button><button id="mode_details" aria-pressed="false">Details</button>
+      <button id="mode_time" aria-pressed="true">Time</button><button id="mode_frequency" aria-pressed="false">Frequency</button><button id="mode_details" aria-pressed="false">Details</button><button id="mode_presence" aria-pressed="false">Presence</button>
     </div>
     <input id="timeline" type="range" min="0" value="0" step="1" aria-label="Timeline">
     <label>Speed
@@ -128,6 +145,7 @@
   <script src="frequency.js"></script>
   <script src="details.js"></script>
   <script src="espectre.js"></script>
+  <script src="presence.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

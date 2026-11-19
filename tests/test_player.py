@@ -123,6 +123,60 @@ def test_espectre_panel_setting_is_saved(client, session):
     assert json.loads((folder / "session.json").read_text())["player_settings"]["espectre_panel"] is True
 
 
+@pytest.mark.parametrize("path", ["/", "/app.js", "/presence.js", "/api/meta"])
+def test_the_browser_rechecks_page_files_after_an_update(client, path):
+    assert client.get(path).headers["cache-control"] == "no-cache"
+
+
+def test_the_index_page_offers_every_view(client):
+    page = client.get("/").text
+    for mode in ("time", "frequency", "details", "presence"):
+        assert f'id="mode_{mode}"' in page
+
+
+def test_presence_arrays_share_one_grid(client):
+    meta = client.get("/api/meta").json()
+    assert meta["presence"]["breathing_window_s"] == 30.0
+    t = np.frombuffer(client.get("/api/array/pres_t").content, "<f8")
+    assert t.size > 0 and np.diff(t) == pytest.approx(1.0)
+    for name in ("pres_breathing", "pres_breathing_hz", "pres_level"):
+        assert np.frombuffer(client.get(f"/api/array/{name}").content, "<f4").size == t.size
+
+
+def test_presence_baseline_is_saved_compared_and_cleared(client, session):
+    folder, _ = session
+    settings = {"window_s": 2.0, "hop_s": 0.1, "method": "mean", "freq_max_hz": 5,
+                "color_auto": True, "color_min": -60, "color_max": 0}
+    assert client.get("/api/presence/baseline").json()["baseline"] is None
+    n_points = np.frombuffer(client.get("/api/array/pres_t").content, "<f8").size
+
+    response = client.post("/api/presence/baseline", json={"start_s": 8.0, "end_s": 20.0})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["baseline"] == [8.0, 20.0] and len(body["distance"]) == n_points
+    assert body["distance"][0] is None  # no full 10 s window at the start
+    assert body["level_floor"] > 0
+    saved = json.loads((folder / "session.json").read_text())["player_settings"]
+    assert saved["presence"]["baseline"] == [8.0, 20.0]
+
+    # Saving the other settings keeps the baseline, and a reload returns it.
+    client.post("/api/player_settings", json={"mode": "presence", "frequency": settings})
+    assert json.loads((folder / "session.json").read_text())["player_settings"]["presence"]["baseline"] == [8.0, 20.0]
+    assert client.get("/api/presence/baseline").json()["baseline"] == [8.0, 20.0]
+
+    assert client.post("/api/presence/baseline", json={}).json()["baseline"] is None
+    client.post("/api/player_settings", json={"mode": "time", "frequency": settings})
+
+
+@pytest.mark.parametrize("body,status", [
+    ({"start_s": 20.0, "end_s": 8.0}, 422),
+    ({"start_s": 8.0}, 422),
+    ({"start_s": 500.0, "end_s": 530.0}, 400),
+])
+def test_bad_presence_baselines_are_rejected(client, body, status):
+    assert client.post("/api/presence/baseline", json=body).status_code == status
+
+
 def test_details_mode_and_panel_are_saved(client, session):
     folder, _ = session
     settings = {"window_s": 2.0, "hop_s": 0.1, "method": "motion", "freq_max_hz": 5,

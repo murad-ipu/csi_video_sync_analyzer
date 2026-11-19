@@ -126,7 +126,9 @@ def test_manifest_records_inputs_code_and_espectre_commit(session):
     assert fingerprint["espectre"]["commit"] != ""
     assert fingerprint["parameters"]["espectre"]["evaluation_interval_ms"] == 250
     assert manifest["frequency_default"]["method"] == "mean"
-    assert set(manifest["files"]) >= {"player_signals.npz", "espectre_lightweight.npz", "espectre_high_accuracy.npz"}
+    assert set(manifest["files"]) >= {"player_signals.npz", "espectre_lightweight.npz", "espectre_high_accuracy.npz",
+                                      "presence.npz"}
+    assert fingerprint["parameters"]["presence"]["breathing_window_s"] == 30.0
 
 
 def test_a_second_run_reuses_the_saved_results(session):

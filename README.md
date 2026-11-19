@@ -50,6 +50,7 @@ This computes everything the player shows, once, and saves it in the session's `
 - **The player's signals**: which subcarriers carry signal, per-frame normalized amplitude, the 0.5 s motion signal, and each frame's mean amplitude.
 - **ESPectre detector replay**: both detectors, packet by packet, one row per 250 ms evaluation (see [ESPectre detectors](#espectre-detectors)).
 - **The Frequency view** for the page's first settings, in `frequency_cache`.
+- **Presence evidence** for the Presence view: breathing peak share, channel shape and motion level, once per second, in `derived\presence.npz`.
 - **`manifest.json`**: hashes of `csi.npz`, `frames.csv` and `csi_meta.json`, a hash of the analysis code, the ESPectre commit (plus a hash of any uncommitted changes in the clone), the parameters, and timings.
 
 You rarely need to run it yourself: `record.py` runs it after every recording, and `player.py` runs it when the results are missing or the manifest no longer matches. Otherwise the player only loads the saved files. A changed input file, analysis code, parameter, or ESPectre version triggers a recompute; `--recompute` forces one. The `derived` folder is safe to delete.
@@ -165,6 +166,20 @@ The bands are saved under `player_settings.frequency.bands` in `session.json` th
 
 A band includes its upper edge but not its lower edge, so a bin on a shared edge is counted once.
 
+## Presence view
+
+The **Presence** button shows three slow features that may tell a still person from an empty room. None of them is a validated detector. ESPectre has no stationary-presence detector yet (it is planned for its v3.3.0), so these are this app's own and meant to be compared against the video. Each value is computed once per second from a window centered on that second.
+
+The charts show the whole recording, with the white line at the current video frame. Click a chart to jump the video there. Hover for values.
+
+- **Breathing peak share (30 s window)**: how much of the slow fluctuation (0.05-2 Hz) sits in one narrow peak between 9 and 30 per minute. Each subcarrier's straight-line drift is removed first. It is a ratio, so signal strength does not matter. The dashed line is what a spectrum with no peak gives (about 0.05). Regular breathing in the right place lifts it clearly above; the hover shows the peak's rate per minute. Walking also lifts it, because walking puts power everywhere, so read it together with the motion level.
+- **Channel shape change from the empty baseline (10 s average)**: how different the average amplitude pattern across the subcarriers is from an empty-room stretch you choose, in percent. A body in the room changes this pattern even when it does not move. So does anything else that changes the room: a moved chair, an open door, a person standing just outside. Pick the baseline close in time to what you compare.
+- **Micro-motion level (median over 10 s, log scale)**: the steady background of the motion signal, ignoring short bursts. The dashed line is the baseline's 95th percentile. A person who keeps very still can stay at the empty-room level.
+
+To choose the baseline, move the video to a moment when the room is empty and click **Use 30 s around the cursor as empty baseline**. It is saved in `session.json` (`player_settings.presence`) and shown as a green band. **Clear baseline** removes it.
+
+For trustworthy comparisons, record empty, still person, and empty again in one session, because separate recordings also differ by drift.
+
 ## Sync test
 
 1. Record 30 s. Stand so the camera sees you and the board.
@@ -186,7 +201,7 @@ python player.py sessions\<folder> --estimate-sync
 | `csi.npz` | `pc_receive_t_ns`, corrected `csi_t_ns`, `device_ticks_us`, sequence fields, `rssi_dbm`, `csi_data` (raw int8 pairs, Q then I), `amplitude` and `phase` (from ESPectre's `CSIPacket`), and `csi_target_pps`. Recordings made before this version have no `phase` or `csi_target_pps` |
 | `csi_meta.json` | Subcarrier count, record version, and `/device`, `/capabilities`, `/sensing` (including the detector settings), `/wifi` read when S is pressed |
 | `diagnostics.csv` | `/diagnostics` once per second. A field the firmware does not report stays empty |
-| `session.json` | Times, counts, rates, camera settings, clock fit, `sync_offset_ms`, and `player_settings` (the player's view, CSI details checkbox, and frequency settings) |
+| `session.json` | Times, counts, rates, camera settings, clock fit, `sync_offset_ms`, and `player_settings` (the player's view, CSI details checkbox, frequency settings, and the Presence view's empty baseline) |
 | `derived\` | Results of `analyze.py`, with `manifest.json`. Safe to delete |
 | `frequency_cache\` | Results saved by the player's frequency mode. Safe to delete |
 
@@ -215,6 +230,7 @@ ESPectre has no equivalent for these, so they are this app's own:
 | Device clock to PC clock fit, video frame gaps, sync offset estimate | `timesync.py` |
 | Signal subcarriers, per-frame normalization, 0.5 s motion signal | `frequency.py` (computed once by `analyze.py`) |
 | Spectrogram, band power, PCA | `frequency.py` |
+| Presence evidence: breathing peak share, channel shape and its baseline comparison, motion level | `frequency.py` (computed once by `analyze.py`) |
 | Video motion energy for `--estimate-sync` | `player.py` |
 | Live CSI rate, occupancy and fps in the recorder's status box | `record.py` |
 
@@ -229,7 +245,7 @@ Each value is computed once, in Python. The page only draws what it receives and
 - `frequency.py` holds the frequency-mode processing and its disk cache, using only numpy. The motion signal and per-frame normalization live here too.
 - `timesync.py` holds the device-to-PC clock fit, the frame-to-CSI lookup, and the offset search. It has no hardware or file access, so it is tested with synthetic data.
 - `espectre_path.py` finds the ESPectre clone and sets up its import paths. No ESPectre code is copied here.
-- `static/` is the web page. `app.js` draws the waterfall and current-frame plots on canvas and uses a local copy of uPlot for the motion and RSSI charts. `frequency.js` draws the frequency-mode panels the same way, `espectre.js` draws the ESPectre detector panel, and `details.js` fills the CSI details tables.
+- `static/` is the web page. `app.js` draws the waterfall and current-frame plots on canvas and uses a local copy of uPlot for the motion and RSSI charts. `frequency.js` draws the frequency-mode panels the same way, `espectre.js` draws the ESPectre detector panel, `presence.js` draws the Presence view, and `details.js` fills the CSI details tables.
 - `tests/` holds the unit tests and an end-to-end recording test using a fake board and synthetic camera. `make_demo_session.py` builds a synthetic session for trying the player without hardware. Tests that need a real recording use any session in `sessions\` and are skipped when there is none.
 
 ## Tests and demo

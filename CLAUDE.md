@@ -10,10 +10,10 @@ A Windows tool that records WiFi CSI from an ESPectre Native board (ESP32, HTTP 
 - `analyze.py` computes every derived value once into `<session>/derived/`, with `manifest.json` deciding when to recompute.
 - `espectre_bridge.py` holds every calculation taken from ESPectre: amplitude and phase (`CSIPacket`), and the offline replay of the Lightweight and High-Accuracy detectors.
 - `player.py` is the FastAPI and uvicorn server for replay, plus the `--estimate-sync` mode. It only loads results.
-- `frequency.py` holds this app's own signal math (subcarrier selection, per-frame normalization, the motion signal, STFT) and the frequency disk cache.
+- `frequency.py` holds this app's own signal math (subcarrier selection, per-frame normalization, the motion signal, STFT, presence evidence) and the frequency disk cache.
 - `timesync.py` holds the pure-numpy alignment math. It has no I/O.
 - `espectre_path.py` puts the sibling ESPectre clone on `sys.path` and runs ESPectre's own `tools.lib.bootstrap.setup_paths()`.
-- `static/` is a plain JS page with no build step. It uses a vendored uPlot and draws on canvas. `app.js` is the core; `frequency.js`, `details.js` and `espectre.js` are per-feature scripts loaded before it.
+- `static/` is a plain JS page with no build step. It uses a vendored uPlot and draws on canvas. `app.js` is the core; `frequency.js`, `details.js`, `espectre.js` and `presence.js` are per-feature scripts loaded before it.
 
 ## Commands
 
@@ -103,12 +103,14 @@ Every board request goes through `Recorder.request()`, which holds `client_lock`
 - **Lazy arrays:** the arrays in `meta.detail_arrays` are fetched only when a details view opens.
 - **ESPectre arrays:** `esp_t`, then `esp_<detector>_score`, `_threshold` and `_state`. The summary is in `meta.espectre`.
 - **Saved state:** `POST /api/sync_offset` (range ±2000 ms) and `POST /api/player_settings` (mode, details panel, ESPectre panel, frequency settings) persist to `session.json`.
+- **Presence:** `derived/presence.npz` holds one point per second (`pres_t`, `pres_breathing`, `pres_breathing_hz`, `pres_level`; the per-subcarrier `shape` stays on the server). `GET`/`POST /api/presence/baseline` reads or saves the empty baseline in `player_settings.presence` (CSI time) and returns each point's shape distance and the level floor, computed by `frequency.presence_baseline`. `POST /api/player_settings` keeps that key unchanged. The manifest stores the presence parameters through a JSON round trip, because a tuple would never compare equal to the list read back.
 - **Adding an array:** compute it in `analyze.py` if it is derived, then add it in `load_session()`, and fetch it in `app.js` `start()` or in the feature script.
 
 ## Tests
 
 - `test_timesync.py`: unit tests on synthetic data.
 - `test_frequency.py`: the STFT math, the frequency API, and its cache.
+- `test_presence.py`: the presence features on synthetic data (breathing rate, drift removal, gaps, baseline distance, level).
 - `test_analyze.py` covers:
   - ESPectre amplitude equals the old `hypot` formula, on the demo session and on every real recording in `sessions/` (those tests are skipped when none exist)
   - the replay equals `replay_idle_stream`
