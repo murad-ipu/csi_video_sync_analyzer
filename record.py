@@ -1,16 +1,24 @@
-"""Record WiFi CSI and webcam video on one PC clock.
+"""Record WiFi CSI from one or more boards and webcam video on one PC clock.
 
     python record.py --target <IP> --camera 0 --duration 300 --out sessions/
+    python record.py --target kitchen=<IP1> --target hall=<IP2> ...   # several boards at once
     python record.py --recover sessions/<folder>      # finish a crashed session
 
 Press S in the preview window to start and Q to stop. D (preview only) switches
-the board between its Lightweight and High-Accuracy detectors with one
-PATCH /sensing; apart from that only GET requests are sent to the board.
-At the end, analyze.py computes the derived results into <session>/derived/.
+every board to the same detector (Lightweight or High-Accuracy) with one
+PATCH /sensing per board; apart from that only GET requests are sent.
+At the end, analyze.py computes each board's derived results into
+<session>/<device>/derived/.
 
-Crash safety: while recording, CSI goes to an append-only csi_stream.bin and
-video to a fragmented video.part.mp4. A clean stop (or --recover) converts them
-to csi.npz and a browser-friendly video.mp4 without re-encoding.
+Layout: the recording folder holds the shared video.mp4, frames.csv and
+session.json; each board gets its own folder named after it, with csi.npz,
+csi_meta.json, diagnostics.csv and its own session.json (clock fit, sync
+offset, player settings).
+
+Crash safety: while recording, each board's CSI goes to an append-only
+<device>/csi_stream.bin and video to a fragmented video.part.mp4. A clean stop
+(or --recover) converts them to csi.npz and a browser-friendly video.mp4
+without re-encoding.
 """
 
 import argparse
@@ -18,6 +26,7 @@ import csv
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -193,23 +202,21 @@ def read_frames_csv(path: Path) -> list:
 
 # --- Finishing a session (clean stop and --recover share this) ------------------------
 
-def finalize_session(folder: Path, status: str = "complete", repo=None) -> dict:
-    """Convert the crash-safe files to their final form and write the summary."""
-    espectre_path.setup(repo)
-    from tools.lib.csi_io import normalize_stored_csi_bin_layout
+def _finalize_csi(device_dir: Path, info: dict, normalize_layout) -> np.ndarray | None:
+    """Build one board's csi.npz from its csi_stream.bin. Fills info["csi"] and info["time_fit"].
 
-    session = read_json(folder / "session.json")
-    meta = read_json(folder / "csi_meta.json")
-    stream_path, part_path = folder / "csi_stream.bin", folder / "video.part.mp4"
-
-    # CSI: fit the device clock to the PC clock, then build csi.npz.
+    info is the dict that holds this board's run counters: its own session.json,
+    or the recording's for a single-folder session. Returns the stream records.
+    """
+    meta = read_json(device_dir / "csi_meta.json")
+    stream_path = device_dir / "csi_stream.bin"
     fit = timesync.fit_device_to_pc([], [])
     records = None
     if stream_path.exists():
         records = read_csi_stream(stream_path)
         fit = timesync.fit_device_to_pc(records["device_ticks_us"].astype(np.int64), records["pc_receive_t_ns"])
         # Uses the clone's layout check so subcarrier order stays correct for any chip.
-        iq = normalize_stored_csi_bin_layout(np.array(records["iq"]))
+        iq = normalize_layout(np.array(records["iq"]))
         # Amplitude and phase come from ESPectre's CSIPacket (complex value I + jQ).
         amplitude, phase = espectre_bridge.amplitude_phase(iq)
         # ESPectre datasets store the board's packet rate, so its replay uses it.
@@ -217,7 +224,7 @@ def finalize_session(folder: Path, status: str = "complete", repo=None) -> dict:
         target_pps = meta.get("sensing", {}).get("csi_target_pps")
         if target_pps:
             extra["csi_target_pps"] = np.int64(target_pps)
-        temp = folder / "csi.tmp.npz"
+        temp = device_dir / "csi.tmp.npz"
         with open(temp, "wb") as file:
             np.savez(
                 file,
@@ -236,11 +243,57 @@ def finalize_session(folder: Path, status: str = "complete", repo=None) -> dict:
                 phase=phase,
                 **extra,
             )
-        os.replace(temp, folder / "csi.npz")
+        os.replace(temp, device_dir / "csi.npz")
         meta["subcarrier_count"] = int(amplitude.shape[1])
         meta["iq_order"] = "csi_data holds int8 pairs: Q first, then I"
         meta["derived_values"] = "amplitude and phase (radians) of I + jQ, from ESPectre's CSIPacket"
-        write_json_atomic(folder / "csi_meta.json", meta)
+        write_json_atomic(device_dir / "csi_meta.json", meta)
+
+    run = info.get("run", {})
+    n_csi = 0 if records is None else int(records.size)
+    csi_seconds = 0.0
+    sequence_gaps = board_drops = backpressure = 0
+    if n_csi:
+        csi_seconds = float(records["pc_receive_t_ns"][-1] - records["pc_receive_t_ns"][0]) / 1e9
+        sequence_gaps = int(np.maximum(np.diff(records["stream_sequence"].astype(np.int64)) - 1, 0).sum())
+        board_drops = int(records["raw_drop_total"][-1])
+        backpressure = int(records["send_backpressure_total"][-1])
+    info["csi"] = {
+        "frames": n_csi,
+        "average_pps": (n_csi - 1) / csi_seconds if csi_seconds else 0.0,
+        "duration_s": csi_seconds,
+        "sequence_gaps": sequence_gaps,
+        "board_raw_drop_total": run.get("board_raw_drop_total", board_drops),
+        "board_send_backpressure_total": run.get("board_send_backpressure_total", backpressure),
+        "records_with_other_size_skipped": run.get("csi_size_mismatch", 0),
+    }
+    info["time_fit"] = fit.to_dict()
+    return records
+
+
+def finalize_session(folder: Path, status: str = "complete", repo=None) -> dict:
+    """Convert the crash-safe files to their final form and write the summaries.
+
+    The video is in the recording folder and each board's CSI in its own device
+    folder (analyze.device_folders). Returns the recording's session.json.
+    """
+    espectre_path.setup(repo)
+    from tools.lib.csi_io import normalize_stored_csi_bin_layout
+
+    folder = Path(folder)
+    session = read_json(folder / "session.json")
+    device_dirs = analyze.device_folders(folder)
+    single = device_dirs == [folder]  # an older single-board session: everything in one folder
+    part_path = folder / "video.part.mp4"
+
+    # CSI: fit each board's clock to the PC clock, then build its csi.npz.
+    infos, last_times = {}, []
+    for device_dir in device_dirs:
+        info = session if single else read_json(device_dir / "session.json")
+        records = _finalize_csi(device_dir, info, normalize_stored_csi_bin_layout)
+        if records is not None and records.size:
+            last_times.append(int(records["pc_receive_t_ns"][-1]))
+        infos[device_dir] = info
 
     # Video: make it browser-friendly and keep frames.csv in step with it.
     frames = read_frames_csv(folder / "frames.csv")
@@ -276,72 +329,87 @@ def finalize_session(folder: Path, status: str = "complete", repo=None) -> dict:
         "dropped_estimated_from_gaps": timesync.count_frame_gaps(frame_times),
         "dropped_encoder_queue": run.get("video_queue_drops", 0),
     }
-    n_csi = 0 if records is None else int(records.size)
-    csi_seconds = 0.0
-    sequence_gaps = board_drops = backpressure = 0
-    if n_csi:
-        csi_seconds = float(records["pc_receive_t_ns"][-1] - records["pc_receive_t_ns"][0]) / 1e9
-        sequence_gaps = int(np.maximum(np.diff(records["stream_sequence"].astype(np.int64)) - 1, 0).sum())
-        board_drops = int(records["raw_drop_total"][-1])
-        backpressure = int(records["send_backpressure_total"][-1])
-    session["csi"] = {
-        "frames": n_csi,
-        "average_pps": (n_csi - 1) / csi_seconds if csi_seconds else 0.0,
-        "duration_s": csi_seconds,
-        "sequence_gaps": sequence_gaps,
-        "board_raw_drop_total": run.get("board_raw_drop_total", board_drops),
-        "board_send_backpressure_total": run.get("board_send_backpressure_total", backpressure),
-        "records_with_other_size_skipped": run.get("csi_size_mismatch", 0),
-    }
-    session["time_fit"] = fit.to_dict()
     session["status"] = status
-    session["sync_offset_ms"] = session.get("sync_offset_ms", 0)
     # After a crash these come from the data, because the stop time was never written.
-    last_times = [int(frame_times[-1])] if frame_times.size else []
-    if n_csi:
-        last_times.append(int(records["pc_receive_t_ns"][-1]))
+    if frame_times.size:
+        last_times.append(int(frame_times[-1]))
     if last_times and "end_t_ns" not in session:
         session["end_t_ns"] = max(last_times)
         session["end_time"] = datetime.fromtimestamp(max(last_times) / 1e9).isoformat(timespec="milliseconds")
         session["duration_s"] = (max(last_times) - session["start_t_ns"]) / 1e9
+
+    if single:
+        session["sync_offset_ms"] = session.get("sync_offset_ms", 0)
+    else:
+        # Each board keeps its own sync offset and player settings in its own session.json.
+        session["devices"] = {}
+        for device_dir, info in infos.items():
+            info.update({key: session[key] for key in ("end_time", "end_t_ns", "duration_s", "stop_reason")
+                         if key in session})
+            info["status"] = status
+            info["sync_offset_ms"] = info.get("sync_offset_ms", 0)
+            write_json_atomic(device_dir / "session.json", info)
+            session["devices"][device_dir.name] = {
+                "target": info.get("target"), "csi": info["csi"], "time_fit": info["time_fit"],
+            }
     write_json_atomic(folder / "session.json", session)
 
     # The intermediates are only removed once their final forms exist.
-    if records is not None and (folder / "csi.npz").exists():
-        stream_path.unlink()
+    for device_dir in device_dirs:
+        if (device_dir / "csi_stream.bin").exists() and (device_dir / "csi.npz").exists():
+            (device_dir / "csi_stream.bin").unlink()
     if video_ok and (folder / "video.mp4").exists():
         part_path.unlink()
     return session
 
 
+def device_summaries(session: dict) -> list:
+    """(name, summary) for each board; the name is None for an older single-board session."""
+    if "devices" in session:
+        return list(session["devices"].items())
+    return [(None, session)] if "csi" in session else []
+
+
 def print_summary(folder: Path, session: dict) -> None:
-    video, csi, fit = session["video"], session["csi"], session["time_fit"]
+    video = session["video"]
     print(f"\nSession saved to {folder}")
     print(f"  status            : {session['status']} ({session.get('stop_reason', 'recovered')})")
     print(f"  video             : {video['frames']} frames, {video['average_fps']:.2f} fps, "
           f"{video['duration_s']:.1f} s, about {video['dropped_estimated_from_gaps']} missing, "
           f"{video['dropped_encoder_queue']} dropped by encoder queue")
-    print(f"  CSI               : {csi['frames']} frames, {csi['average_pps']:.1f} per s, "
-          f"{csi['sequence_gaps']} sequence gaps, {csi['board_raw_drop_total']} dropped on board")
-    print(f"  clock fit         : {fit['method']}, drift {fit['drift_ppm']:.1f} ppm, "
-          f"residual RMS {fit['residual_rms_ms']:.2f} ms, p95 {fit['residual_p95_ms']:.2f} ms")
-    print(f"  CSI network delay : median {fit['latency_median_ms']:.1f} ms, p95 {fit['latency_p95_ms']:.1f} ms")
-    if not fit["ok"]:
-        print("  WARNING: the clock fit is not reliable (recording too short, or implausible drift).")
+    for name, summary in device_summaries(session):
+        csi, fit = summary["csi"], summary["time_fit"]
+        if name is not None:
+            print(f"  device {name} ({summary.get('target')}), folder {folder / name}")
+        print(f"  CSI               : {csi['frames']} frames, {csi['average_pps']:.1f} per s, "
+              f"{csi['sequence_gaps']} sequence gaps, {csi['board_raw_drop_total']} dropped on board")
+        print(f"  clock fit         : {fit['method']}, drift {fit['drift_ppm']:.1f} ppm, "
+              f"residual RMS {fit['residual_rms_ms']:.2f} ms, p95 {fit['residual_p95_ms']:.2f} ms")
+        print(f"  CSI network delay : median {fit['latency_median_ms']:.1f} ms, p95 {fit['latency_p95_ms']:.1f} ms")
+        if not fit["ok"]:
+            print("  WARNING: the clock fit is not reliable (recording too short, or implausible drift).")
 
 
-def analyze_finished_session(folder: Path, repo=None) -> dict | None:
-    """Run analyze.py on a finished session. A failure never costs the recording."""
-    if not (folder / "csi.npz").exists() or not (folder / "frames.csv").exists():
-        return None
-    try:
-        manifest = analyze.run_analysis(folder, repo)
-    except Exception as exc:
-        print(f"Warning: analysis failed ({type(exc).__name__}: {exc}). "
-              f"The recording is intact; retry with: python analyze.py {folder}")
-        return None
-    analyze.print_summary(manifest)
-    return manifest
+def analyze_finished_session(folder: Path, repo=None) -> dict:
+    """Run analyze.py on every board of a finished session. A failure never costs the recording.
+
+    Returns {device folder: manifest or None}.
+    """
+    results = {}
+    for device_dir in analyze.device_folders(folder):
+        results[device_dir] = None
+        if not (device_dir / "csi.npz").exists() or not analyze.input_path(device_dir, "frames.csv").exists():
+            continue
+        label = device_dir.name if device_dir != Path(folder) else ""
+        try:
+            manifest = analyze.run_analysis(device_dir, repo)
+        except Exception as exc:
+            print(f"Warning: analysis of {device_dir} failed ({type(exc).__name__}: {exc}). "
+                  f"The recording is intact; retry with: python analyze.py {device_dir}")
+            continue
+        analyze.print_summary(manifest, label)
+        results[device_dir] = manifest
+    return results
 
 
 # --- Recorder -------------------------------------------------------------------------
@@ -358,41 +426,44 @@ def open_webcam(index: int, width: int, height: int, fps: float):
     return camera
 
 
-class Recorder:
-    """Owns the camera, encoder, CSI, and diagnostics threads."""
+def parse_target(spec: str) -> tuple[str, str]:
+    """'name=IP' or 'IP' -> (folder name, target). Without a name, the target becomes the name."""
+    name, sep, target = spec.partition("=")
+    if not sep:
+        name, target = "", spec
+    target = target.strip()
+    # The name is a folder name, so keep it to characters every file system accepts.
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", (name.strip() or target)).strip("._")
+    return name, target
 
-    def __init__(self, args, camera_factory=open_webcam):
-        espectre_path.setup(args.repo)
+
+class Board:
+    """One ESPectre board: its HTTP connection, /csi stream, diagnostics poll, and files.
+
+    recording and quit are the Recorder's events, shared by every board.
+    """
+
+    def __init__(self, name: str, target: str, recording: threading.Event, quit_event: threading.Event):
         from src.python.espectre_cli.device_transport import DirectClient
         from tools.lib.csi_io import DirectRawCSIReceiver
 
-        self.args = args
-        self.camera_factory = camera_factory
-        self.receiver = DirectRawCSIReceiver(args.target, derive_complex=False)
+        self.name, self.target = name, target
+        self.recording, self.quit = recording, quit_event
+        self._receiver_class = DirectRawCSIReceiver
+        self.receiver = DirectRawCSIReceiver(target, derive_complex=False)
         self.client = DirectClient(self.receiver.control_endpoint, origin=self.receiver.origin, timeout=3.0)
-
-        self.quit = threading.Event()         # everything stops
-        self.recording = threading.Event()    # data is being saved
-        self.camera = None
-        self.camera_settings = {}
-        self.threads = []
-
-        self.session_dir = None
-        self.frame_queue = queue.Queue(maxsize=FRAME_QUEUE_SIZE)
-        self.csi_writer = None
-        self.encoder_thread = None
-        self.csi_thread = None
-        self.start_perf = 0
+        # One request at a time on the board connection (diagnostics thread and detector switch).
+        self.client_lock = threading.Lock()
+        self.sensing_lock = threading.Lock()  # a /sensing refresh and a detector switch never overlap
+        self.board_info = {}
         self.expected_pps = 100.0
+        self.switch_thread = None
+        self.switch_status = ""
 
-        self.latest_frame = None
-        self.camera_times = deque(maxlen=120)
-        self.video_queue_drops = 0
-        self.frames_written = 0
-        self.camera_error = None
-        self.encoder_error = None
+        self.folder = None
+        self.csi_writer = None
+        self.csi_thread = None
         self.csi_error = None
-
         self.csi_count = 0
         self.csi_receive_times = deque(maxlen=2000)
         self.csi_device_ticks = deque(maxlen=2000)
@@ -406,29 +477,259 @@ class Recorder:
         self.diagnostics_file = None
         self.diagnostics_writer = None
         self.diagnostics_lock = threading.Lock()
-        # One request at a time on the board connection (diagnostics thread and detector switch).
-        self.client_lock = threading.Lock()
-        self.sensing_lock = threading.Lock()  # a /sensing refresh and a detector switch never overlap
-        self.board_info = {}
-        self.switch_thread = None
-        self.switch_status = ""
 
     def request(self, method: str, resource: str, data: dict | None = None, timeout: float | None = None) -> dict:
         with self.client_lock:
             return self.client.request(method, resource, data, timeout=timeout)
-
-    # Startup ---------------------------------------------------------------------------
 
     def read_board_info(self) -> dict:
         """Read everything needed for csi_meta.json before /csi is opened."""
         try:
             info = {name: self.request("get", name) for name in ("device", "capabilities", "sensing", "wifi")}
         except Exception as exc:
-            raise SystemExit(f"Cannot reach the board at {self.args.target}: {exc}")
+            raise SystemExit(f"Cannot reach board {self.name} at {self.target}: {exc}")
         if not info["sensing"].get("enabled", True):
-            raise SystemExit("Sensing is disabled on the board, so /csi would fail. Enable it first.")
+            raise SystemExit(f"Sensing is disabled on board {self.name}, so /csi would fail. Enable it first.")
         self.expected_pps = float(info["sensing"].get("csi_target_pps") or 100.0)
+        self.board_info = info
         return info
+
+    # /csi session ----------------------------------------------------------------------
+
+    def open_csi(self) -> None:
+        """Re-read /sensing and open /csi. Nothing is written to disk here."""
+        # Read /sensing again so csi_meta.json holds the settings in force right now.
+        try:
+            self.board_info["sensing"] = self.request("get", "sensing", timeout=3.0)
+        except Exception as exc:
+            raise RuntimeError(f"board {self.name}: cannot read /sensing: {exc}") from exc
+        # A fresh receiver for every attempt, so a refused start never leaves a callback behind.
+        self.receiver = self._receiver_class(self.target, derive_complex=False)
+        self.receiver.add_callback(self._on_csi_packet)
+        try:
+            self.receiver.start()
+        except RuntimeError as exc:
+            if "409" in str(exc):
+                raise RuntimeError(f"board {self.name} already has a /csi session open (HTTP 409); "
+                                   f"close the other client") from exc
+            raise RuntimeError(f"board {self.name}: {exc}") from exc
+
+    def create_files(self, folder: Path, session_base: dict) -> None:
+        """Make this board's folder and its files. Called once /csi is open on every board."""
+        self.folder = folder
+        folder.mkdir()
+        write_json_atomic(folder / "csi_meta.json", {"target": self.target, "record_version": 8, **self.board_info})
+        write_json_atomic(folder / "session.json", {
+            **session_base, "device": self.name, "target": self.target, "sync_offset_ms": 0,
+        })
+        self.csi_writer = CsiStreamWriter(folder / "csi_stream.bin")
+        with self.diagnostics_lock:
+            self.diagnostics_file = open(folder / "diagnostics.csv", "w", newline="", encoding="utf-8")
+            self.diagnostics_writer = csv.writer(self.diagnostics_file)
+            self.diagnostics_writer.writerow(["pc_t_ns"] + DIAGNOSTIC_FIELDS + [f"raw_csi_{name}" for name in RAW_CSI_FIELDS])
+
+    def start_csi_thread(self) -> None:
+        self.csi_thread = threading.Thread(target=self._csi_loop, name=f"csi-{self.name}", daemon=True)
+        self.csi_thread.start()
+
+    def stop_csi(self) -> None:
+        """Closing the connection is what ends the /csi session on the board."""
+        self.receiver.stop()
+        if self.csi_thread is not None:
+            self.csi_thread.join(timeout=5.0)
+
+    def close_files(self, run_info: dict) -> None:
+        if self.csi_writer is not None:
+            self.csi_writer.close()
+        with self.diagnostics_lock:
+            self.diagnostics_writer = None
+            if self.diagnostics_file is not None:
+                self.diagnostics_file.close()
+        session = read_json(self.folder / "session.json")
+        session["run"] = {
+            "csi_size_mismatch": self.csi_size_mismatch,
+            "board_raw_drop_total": self.receiver.raw_drop_total,
+            "board_send_backpressure_total": self.receiver.raw_send_backpressure_total,
+        }
+        session.update(run_info)
+        write_json_atomic(self.folder / "session.json", session)
+
+    # Threads ---------------------------------------------------------------------------
+
+    def _on_csi_packet(self, packet) -> None:
+        """Called once per CSI record on this board's receiver thread."""
+        if not self.recording.is_set():
+            return
+        pc_t_ns, perf_t_ns = time.time_ns(), time.perf_counter_ns()
+        sequence = packet.raw_stream_sequence or 0
+        if self.last_stream_sequence is not None:
+            self.csi_sequence_gaps += max(0, sequence - self.last_stream_sequence - 1)
+        self.last_stream_sequence = sequence
+        self.latest_packet_drop_total = packet.raw_drop_total or 0
+        noise = packet.noise_floor_dbm if packet.noise_floor_dbm is not None else NOISE_FLOOR_UNKNOWN
+        fields = (
+            pc_t_ns, perf_t_ns, packet.device_ticks_us or 0, packet.wifi_rx_ts_us or 0, packet.seq_num,
+            sequence, packet.raw_drop_total or 0, packet.raw_send_backpressure_total or 0,
+            packet.rssi_dbm or 0, noise, packet.channel or 0,
+        )
+        if not self.csi_writer.write(fields, packet.iq_raw):
+            self.csi_size_mismatch += 1
+            return
+        self.csi_count += 1
+        self.csi_receive_times.append(perf_t_ns)
+        self.csi_device_ticks.append(packet.device_ticks_us or 0)
+
+    def _csi_loop(self) -> None:
+        try:
+            self.receiver.run()
+        except Exception as exc:
+            if self.recording.is_set():
+                self.csi_error = f"{type(exc).__name__}: {exc}"
+
+    def _diagnostic_field_names(self) -> list:
+        """Ask only for fields this firmware lists: an unknown name fails the request."""
+        try:
+            catalog = self.request("get", "diagnostics", {"fields": []}, timeout=2.0)
+            names = {item.get("name") for item in catalog.get("fields", []) if isinstance(item, dict)}
+        except Exception:
+            return ["*"]
+        if not names:
+            return ["*"]
+        fields = [name for name in DIAGNOSTIC_FIELDS if name in names]
+        if any(str(name).startswith("raw_csi.") for name in names):
+            fields.append("raw_csi")
+        return fields or ["*"]
+
+    def diagnostics_loop(self) -> None:
+        fields = self._diagnostic_field_names()
+        next_poll = time.monotonic()
+        while not self.quit.wait(max(0.0, next_poll - time.monotonic())):
+            next_poll += 1.0
+            pc_t_ns = time.time_ns()
+            try:
+                values = self.request("get", "diagnostics", {"fields": fields}, timeout=2.0)
+                # In preview, keep the board's detector and calibration state current.
+                # The lock stops a reading taken before a switch from overwriting its result.
+                with self.sensing_lock:
+                    if not self.recording.is_set() and self.switch_thread is None:
+                        self.board_info["sensing"] = self.request("get", "sensing", timeout=2.0)
+            except Exception as exc:
+                self.diagnostics_status = f"error: {exc}"
+                continue
+            self.diagnostics_status = "ok"
+            self.latest_diagnostics = values
+            with self.diagnostics_lock:
+                if self.diagnostics_writer is not None:
+                    raw = values.get("raw_csi") if isinstance(values.get("raw_csi"), dict) else {}
+                    # A field the firmware does not report stays empty, never zero.
+                    self.diagnostics_writer.writerow(
+                        [pc_t_ns] + [values.get(name, "") for name in DIAGNOSTIC_FIELDS]
+                        + [raw.get(name, "") for name in RAW_CSI_FIELDS]
+                    )
+                    self.diagnostics_file.flush()
+
+    # Detector switch (preview only) ------------------------------------------------------
+
+    def detector(self) -> str | None:
+        return self.board_info.get("sensing", {}).get("detector")
+
+    def switch_detector(self, target: str) -> bool:
+        """Ask this board to run the target detector. Returns False if not allowed now.
+
+        This PATCH /sensing is the only request the recorder sends that is not a
+        GET, and only when the user presses D before recording. During a /csi
+        session the board would refuse it (409) and runs no detector anyway.
+        """
+        if self.recording.is_set() or self.switch_thread is not None:
+            return False
+        self.switch_status = f"switching to {target}..."
+        self.switch_thread = threading.Thread(target=self._switch, args=(target,), name=f"switch-{self.name}",
+                                              daemon=True)
+        self.switch_thread.start()
+        return True
+
+    def _switch(self, target: str) -> None:
+        with self.sensing_lock:
+            try:
+                self.request("patch", "sensing", {"detector": target}, timeout=5.0)
+                self.board_info["sensing"] = self.request("get", "sensing", timeout=3.0)
+                self.switch_status = ""
+            except Exception as exc:
+                self.switch_status = f"switch failed: {exc}"
+            finally:
+                self.switch_thread = None
+
+    def detector_line(self) -> str:
+        sensing = self.board_info.get("sensing", {})
+        threshold = sensing.get("threshold")
+        threshold_text = f"{threshold:.2f}" if isinstance(threshold, (int, float)) else "--"
+        state = self.switch_status or ("calibrating" if sensing.get("calibrating") else
+                                       "ready" if sensing.get("ready") else "not ready")
+        return (f"  detector {sensing.get('detector', '--')}   threshold {threshold_text}   "
+                f"hits {sensing.get('motion_on_hits', '--')}/{sensing.get('motion_off_hits', '--')}   [{state}]")
+
+    # Live numbers ----------------------------------------------------------------------
+
+    def csi_rate(self) -> float:
+        """CSI frames received during the last second."""
+        now = time.perf_counter_ns()
+        return float(sum(1 for t in list(self.csi_receive_times) if now - t <= 1_000_000_000))
+
+    def host_occupancy(self) -> float:
+        """Share of the expected CSI time slots filled during the last second.
+
+        Packets of a /csi session skip the board's own sampler, so its
+        csi_occupancy reads 0 while recording. This uses device timestamps.
+        """
+        ticks = np.array(list(self.csi_device_ticks), dtype=np.int64)
+        if ticks.size == 0:
+            return 0.0
+        slot_us = max(1, int(1_000_000 / self.expected_pps))
+        recent = ticks[ticks > ticks[-1] - 1_000_000]
+        return min(1.0, np.unique(recent // slot_us).size / self.expected_pps)
+
+    def recording_line(self) -> str:
+        return (f"{self.name}  CSI {self.csi_rate():4.0f}/s   occupancy {self.host_occupancy() * 100:3.0f}% (host)   "
+                f"seq gaps {self.csi_sequence_gaps}   board drops {self.latest_packet_drop_total}")
+
+    def preview_line(self) -> str:
+        diagnostics = self.latest_diagnostics
+        occupancy = diagnostics.get("csi_occupancy")
+        occupancy_text = f"{occupancy * 100:.0f}%" if isinstance(occupancy, (int, float)) else "--"
+        return (f"{self.name}  CSI {diagnostics.get('csi_accepted_pps', '--')}/s   occupancy {occupancy_text}   "
+                f"RSSI {diagnostics.get('wifi_rssi_dbm', '--')}   [{self.diagnostics_status[:30]}]")
+
+
+class Recorder:
+    """Owns the camera and encoder threads, and one Board per --target."""
+
+    def __init__(self, args, camera_factory=open_webcam):
+        espectre_path.setup(args.repo)
+        self.args = args
+        self.camera_factory = camera_factory
+
+        self.quit = threading.Event()         # everything stops
+        self.recording = threading.Event()    # data is being saved
+        self.boards = [Board(name, target, self.recording, self.quit)
+                       for name, target in (parse_target(spec) for spec in args.target)]
+        self.camera = None
+        self.camera_settings = {}
+        self.threads = []
+
+        self.session_dir = None
+        self.frame_queue = queue.Queue(maxsize=FRAME_QUEUE_SIZE)
+        self.encoder_thread = None
+        self.start_perf = 0
+
+        self.latest_frame = None
+        self.camera_times = deque(maxlen=120)
+        self.video_queue_drops = 0
+        self.frames_written = 0
+        self.camera_error = None
+        self.encoder_error = None
+        self.switch_message = ""
+
+    # Startup ---------------------------------------------------------------------------
 
     def open_camera(self) -> None:
         args = self.args
@@ -449,10 +750,14 @@ class Recorder:
         }
 
     def start_preview(self) -> None:
-        self.board_info = self.read_board_info()
+        for board in self.boards:
+            board.read_board_info()
         self.open_camera()
-        for target in (self._camera_loop, self._diagnostics_loop):
-            thread = threading.Thread(target=target, name=target.__name__, daemon=True)
+        targets = [(self._camera_loop, "camera")]
+        # One diagnostics thread per board, so a slow board never delays the others.
+        targets += [(board.diagnostics_loop, f"diagnostics-{board.name}") for board in self.boards]
+        for target, name in targets:
+            thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self.threads.append(thread)
 
@@ -527,182 +832,81 @@ class Recorder:
                 except Exception as exc:
                     self.encoder_error = self.encoder_error or f"closing video: {exc}"
 
-    def _on_csi_packet(self, packet) -> None:
-        """Called once per CSI record on the receiver thread."""
-        if not self.recording.is_set():
-            return
-        pc_t_ns, perf_t_ns = time.time_ns(), time.perf_counter_ns()
-        sequence = packet.raw_stream_sequence or 0
-        if self.last_stream_sequence is not None:
-            self.csi_sequence_gaps += max(0, sequence - self.last_stream_sequence - 1)
-        self.last_stream_sequence = sequence
-        self.latest_packet_drop_total = packet.raw_drop_total or 0
-        noise = packet.noise_floor_dbm if packet.noise_floor_dbm is not None else NOISE_FLOOR_UNKNOWN
-        fields = (
-            pc_t_ns, perf_t_ns, packet.device_ticks_us or 0, packet.wifi_rx_ts_us or 0, packet.seq_num,
-            sequence, packet.raw_drop_total or 0, packet.raw_send_backpressure_total or 0,
-            packet.rssi_dbm or 0, noise, packet.channel or 0,
-        )
-        if not self.csi_writer.write(fields, packet.iq_raw):
-            self.csi_size_mismatch += 1
-            return
-        self.csi_count += 1
-        self.csi_receive_times.append(perf_t_ns)
-        self.csi_device_ticks.append(packet.device_ticks_us or 0)
-
-    def _csi_loop(self) -> None:
-        try:
-            self.receiver.run()
-        except Exception as exc:
-            if self.recording.is_set():
-                self.csi_error = f"{type(exc).__name__}: {exc}"
-
-    def _diagnostic_field_names(self) -> list:
-        """Ask only for fields this firmware lists: an unknown name fails the request."""
-        try:
-            catalog = self.request("get", "diagnostics", {"fields": []}, timeout=2.0)
-            names = {item.get("name") for item in catalog.get("fields", []) if isinstance(item, dict)}
-        except Exception:
-            return ["*"]
-        if not names:
-            return ["*"]
-        fields = [name for name in DIAGNOSTIC_FIELDS if name in names]
-        if any(str(name).startswith("raw_csi.") for name in names):
-            fields.append("raw_csi")
-        return fields or ["*"]
-
-    def _diagnostics_loop(self) -> None:
-        fields = self._diagnostic_field_names()
-        next_poll = time.monotonic()
-        while not self.quit.wait(max(0.0, next_poll - time.monotonic())):
-            next_poll += 1.0
-            pc_t_ns = time.time_ns()
-            try:
-                values = self.request("get", "diagnostics", {"fields": fields}, timeout=2.0)
-                # In preview, keep the board's detector and calibration state current.
-                # The lock stops a reading taken before a switch from overwriting its result.
-                with self.sensing_lock:
-                    if not self.recording.is_set() and self.switch_thread is None:
-                        self.board_info["sensing"] = self.request("get", "sensing", timeout=2.0)
-            except Exception as exc:
-                self.diagnostics_status = f"error: {exc}"
-                continue
-            self.diagnostics_status = "ok"
-            self.latest_diagnostics = values
-            with self.diagnostics_lock:
-                if self.diagnostics_writer is not None:
-                    raw = values.get("raw_csi") if isinstance(values.get("raw_csi"), dict) else {}
-                    # A field the firmware does not report stays empty, never zero.
-                    self.diagnostics_writer.writerow(
-                        [pc_t_ns] + [values.get(name, "") for name in DIAGNOSTIC_FIELDS]
-                        + [raw.get(name, "") for name in RAW_CSI_FIELDS]
-                    )
-                    self.diagnostics_file.flush()
-
     # Detector switch (preview only) ------------------------------------------------------
 
+    def switching(self) -> bool:
+        return any(board.switch_thread is not None for board in self.boards)
+
     def switch_detector(self) -> bool:
-        """Ask the board to switch between its two detectors. Returns False if not allowed now.
+        """Switch every board to the detector the first board is not running, so they all match.
 
-        This PATCH /sensing is the only request the recorder sends that is not a
-        GET, and only when the user presses D before recording. During a /csi
-        session the board would refuse it (409) and runs no detector anyway.
+        Returns False if not allowed now (recording, or a switch still running).
+        A board that already runs that detector gets no request.
         """
-        if self.recording.is_set() or self.switch_thread is not None:
+        if self.recording.is_set() or self.switching():
             return False
-        current = self.board_info.get("sensing", {}).get("detector")
-        target = "high_accuracy" if current == "lightweight" else "lightweight"
-        self.switch_status = f"switching to {target}..."
-        self.switch_thread = threading.Thread(target=self._switch, args=(target,), name="switch", daemon=True)
-        self.switch_thread.start()
+        target = "high_accuracy" if self.boards[0].detector() == "lightweight" else "lightweight"
+        for board in self.boards:
+            if board.detector() != target:
+                board.switch_detector(target)
         return True
-
-    def _switch(self, target: str) -> None:
-        with self.sensing_lock:
-            try:
-                self.request("patch", "sensing", {"detector": target}, timeout=5.0)
-                self.board_info["sensing"] = self.request("get", "sensing", timeout=3.0)
-                self.switch_status = ""
-            except Exception as exc:
-                self.switch_status = f"switch failed: {exc}"
-            finally:
-                self.switch_thread = None
-
-    def detector_line(self) -> str:
-        sensing = self.board_info.get("sensing", {})
-        threshold = sensing.get("threshold")
-        threshold_text = f"{threshold:.2f}" if isinstance(threshold, (int, float)) else "--"
-        state = self.switch_status or ("calibrating" if sensing.get("calibrating") else
-                                       "ready" if sensing.get("ready") else "not ready")
-        return (f"Detector {sensing.get('detector', '--')}   threshold {threshold_text}   "
-                f"hits {sensing.get('motion_on_hits', '--')}/{sensing.get('motion_off_hits', '--')}   "
-                f"[{state}]   D = switch")
 
     # Recording -------------------------------------------------------------------------
 
     def begin_recording(self) -> None:
-        if self.switch_thread is not None:
-            raise RuntimeError("the board is still switching detector; try again in a moment")
-        # Read /sensing again so csi_meta.json holds the settings in force right now.
+        if self.switching():
+            raise RuntimeError("a board is still switching detector; try again in a moment")
+        # Open /csi on every board first: if one refuses, nothing has been created on disk
+        # and the boards already opened are released again.
+        opened = []
         try:
-            self.board_info["sensing"] = self.request("get", "sensing", timeout=3.0)
-        except Exception as exc:
-            raise RuntimeError(f"cannot read /sensing: {exc}") from exc
-        # Open /csi first: if the board refuses, nothing has been created on disk.
-        self.receiver.add_callback(self._on_csi_packet)
-        try:
-            self.receiver.start()
-        except RuntimeError as exc:
-            if "409" in str(exc):
-                raise RuntimeError("the board already has a /csi session open (HTTP 409); close the other client") from exc
+            for board in self.boards:
+                board.open_csi()
+                opened.append(board)
+        except Exception:
+            for board in opened:
+                board.receiver.stop()
             raise
 
         args = self.args
         now = datetime.now()
+        start_t_ns = time.time_ns()
         self.session_dir = Path(args.out) / now.strftime("%Y%m%d_%H%M%S")
         self.session_dir.mkdir(parents=True, exist_ok=False)
-        write_json_atomic(self.session_dir / "csi_meta.json", {"target": args.target, "record_version": 8, **self.board_info})
+        base = {"status": "recording", "start_time": now.isoformat(timespec="milliseconds"), "start_t_ns": start_t_ns}
         write_json_atomic(self.session_dir / "session.json", {
-            "status": "recording",
-            "start_time": now.isoformat(timespec="milliseconds"),
-            "start_t_ns": time.time_ns(),
+            **base,
             "requested_duration_s": args.duration,
             "video": {"camera": self.camera_settings},
-            "sync_offset_ms": 0,
+            "devices": {board.name: {"target": board.target} for board in self.boards},
         })
-
-        self.csi_writer = CsiStreamWriter(self.session_dir / "csi_stream.bin")
-        with self.diagnostics_lock:
-            self.diagnostics_file = open(self.session_dir / "diagnostics.csv", "w", newline="", encoding="utf-8")
-            self.diagnostics_writer = csv.writer(self.diagnostics_file)
-            self.diagnostics_writer.writerow(["pc_t_ns"] + DIAGNOSTIC_FIELDS + [f"raw_csi_{name}" for name in RAW_CSI_FIELDS])
+        for board in self.boards:
+            board.create_files(self.session_dir / board.name, base)
 
         self.encoder_thread = threading.Thread(target=self._encoder_loop, name="encoder", daemon=True)
         self.encoder_thread.start()
         self.start_perf = time.perf_counter_ns()
         self.recording.set()
-        self.csi_thread = threading.Thread(target=self._csi_loop, name="csi", daemon=True)
-        self.csi_thread.start()
+        for board in self.boards:
+            board.start_csi_thread()
 
     def elapsed_s(self) -> float:
         return (time.perf_counter_ns() - self.start_perf) / 1e9 if self.recording.is_set() else 0.0
 
     def failure(self) -> str | None:
-        return self.csi_error or self.encoder_error or self.camera_error
+        for board in self.boards:
+            if board.csi_error:
+                return f"board {board.name}: {board.csi_error}"
+        return self.encoder_error or self.camera_error
 
     def stop_recording(self, reason: str) -> dict:
         end_ns, end_iso = time.time_ns(), datetime.now().isoformat(timespec="milliseconds")
         self.recording.clear()
 
-        # Closing the connection is what ends the /csi session on the board.
-        self.receiver.stop()
-        self.csi_thread.join(timeout=5.0)
+        for board in self.boards:
+            board.stop_csi()
         self.frame_queue.put(None)
         self.encoder_thread.join(timeout=30.0)
-        self.csi_writer.close()
-        with self.diagnostics_lock:
-            self.diagnostics_writer = None
-            self.diagnostics_file.close()
 
         session = read_json(self.session_dir / "session.json")
         session.update({
@@ -710,18 +914,21 @@ class Recorder:
             "end_t_ns": end_ns,
             "duration_s": (end_ns - session["start_t_ns"]) / 1e9,
             "stop_reason": reason,
-            "run": {
-                "video_queue_drops": self.video_queue_drops,
-                "csi_size_mismatch": self.csi_size_mismatch,
-                "board_raw_drop_total": self.receiver.raw_drop_total,
-                "board_send_backpressure_total": self.receiver.raw_send_backpressure_total,
-            },
+            "run": {"video_queue_drops": self.video_queue_drops},
         })
         write_json_atomic(self.session_dir / "session.json", session)
+        for board in self.boards:
+            board.close_files({key: session[key] for key in ("end_time", "end_t_ns", "duration_s", "stop_reason")})
         session = finalize_session(self.session_dir, repo=self.args.repo)
         print("Analyzing the session (amplitudes, motion, ESPectre detectors)...")
         analyze_finished_session(self.session_dir, self.args.repo)
         return session
+
+    def release_boards(self) -> None:
+        """After an unexpected error: close every /csi session and leave the files for --recover."""
+        self.recording.clear()
+        for board in self.boards:
+            board.receiver.stop()
 
     def close(self) -> None:
         self.quit.set()
@@ -729,7 +936,8 @@ class Recorder:
             thread.join(timeout=3.0)
         if self.camera is not None:
             self.camera.release()
-        self.client.close()
+        for board in self.boards:
+            board.client.close()
 
     # Live numbers ----------------------------------------------------------------------
 
@@ -737,44 +945,21 @@ class Recorder:
         times = list(self.camera_times)
         return (len(times) - 1) * 1e9 / (times[-1] - times[0]) if len(times) > 1 and times[-1] > times[0] else 0.0
 
-    def csi_rate(self) -> float:
-        """CSI frames received during the last second."""
-        now = time.perf_counter_ns()
-        return float(sum(1 for t in list(self.csi_receive_times) if now - t <= 1_000_000_000))
-
-    def host_occupancy(self) -> float:
-        """Share of the expected CSI time slots filled during the last second.
-
-        Packets of a /csi session skip the board's own sampler, so its
-        csi_occupancy reads 0 while recording. This uses device timestamps.
-        """
-        ticks = np.array(list(self.csi_device_ticks), dtype=np.int64)
-        if ticks.size == 0:
-            return 0.0
-        slot_us = max(1, int(1_000_000 / self.expected_pps))
-        recent = ticks[ticks > ticks[-1] - 1_000_000]
-        return min(1.0, np.unique(recent // slot_us).size / self.expected_pps)
-
     def status_lines(self) -> list:
-        diagnostics = self.latest_diagnostics
         if self.recording.is_set():
             limit = f" / {self.args.duration:.0f}s" if self.args.duration else ""
             return [
                 f"REC {self.elapsed_s():6.1f}s{limit}   Q = stop",
-                f"CSI {self.csi_rate():5.0f}/s   occupancy {self.host_occupancy() * 100:3.0f}% (host)",
-                f"Video {self.video_fps():5.1f} fps   frames {self.frames_written}",
-                f"Dropped  video queue {self.video_queue_drops}   CSI seq {self.csi_sequence_gaps}   "
-                f"board {self.latest_packet_drop_total}",
-            ]
-        occupancy = diagnostics.get("csi_occupancy")
-        occupancy_text = f"{occupancy * 100:.0f}%" if isinstance(occupancy, (int, float)) else "--"
-        return [
-            "PREVIEW   S = start   Q = quit",
+                f"Video {self.video_fps():5.1f} fps   frames {self.frames_written}   "
+                f"dropped by video queue {self.video_queue_drops}",
+            ] + [board.recording_line()[:90] for board in self.boards]
+        lines = [
+            "PREVIEW   S = start   Q = quit   D = switch detector",
             f"Video {self.video_fps():5.1f} fps   {self.camera_settings['actual']['width']}x{self.camera_settings['actual']['height']}",
-            f"Board  CSI {diagnostics.get('csi_accepted_pps', '--')}/s   occupancy {occupancy_text}   "
-            f"RSSI {diagnostics.get('wifi_rssi_dbm', '--')}   [{self.diagnostics_status[:40]}]",
-            self.detector_line()[:90],
         ]
+        for board in self.boards:
+            lines += [board.preview_line()[:90], board.detector_line()[:90]]
+        return lines
 
 
 def draw_status(frame: np.ndarray, lines: list) -> np.ndarray:
@@ -855,9 +1040,8 @@ def run_recorder(args, camera_factory=open_webcam):
             result = (recorder.session_dir, recorder.stop_recording("ctrl+c"))
     finally:
         if recorder.recording.is_set():
-            # An unexpected exception: release the board and leave files for --recover.
-            recorder.recording.clear()
-            recorder.receiver.stop()
+            # An unexpected exception: release the boards and leave files for --recover.
+            recorder.release_boards()
         recorder.close()
         if show_window:
             cv2.destroyAllWindows()
@@ -865,8 +1049,10 @@ def run_recorder(args, camera_factory=open_webcam):
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="Record WiFi CSI and webcam video on one PC clock.")
-    parser.add_argument("--target", help="Board IP address (port 62587 is assumed)")
+    parser = argparse.ArgumentParser(description="Record WiFi CSI from one or more boards and webcam video on one PC clock.")
+    parser.add_argument("--target", action="append", metavar="[NAME=]IP",
+                        help="Board IP address (port 62587 is assumed). Repeat it to record several boards at once. "
+                             "NAME is the board's folder in the session (default: the address)")
     parser.add_argument("--camera", type=int, default=0, help="Camera index (default 0)")
     parser.add_argument("--duration", type=float, default=0, help="Stop after this many seconds (0 = until Q)")
     parser.add_argument("--out", default="sessions", help="Parent folder for sessions")
@@ -880,6 +1066,17 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if not args.recover and not args.target:
         parser.error("--target is required")
+    if args.target:
+        # Allow comma-separated lists too: --target 192.168.1.10,192.168.1.11
+        args.target = [spec.strip() for value in args.target for spec in value.split(",") if spec.strip()]
+        parsed = [parse_target(spec) for spec in args.target]
+        names, targets = [name for name, _ in parsed], [target for _, target in parsed]
+        if not all(names) or not all(targets):
+            parser.error("every --target needs an address, and a name made of letters, digits, '.', '_' or '-'")
+        if len(set(names)) != len(names):
+            parser.error(f"two boards would share a folder name: {', '.join(names)}. Name them with NAME=IP")
+        if len(set(targets)) != len(targets):
+            parser.error("the same board address is given twice")
     if args.no_window and not (args.autostart and args.duration):
         parser.error("--no-window needs --autostart and --duration, otherwise nothing could stop it")
     return args

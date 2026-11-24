@@ -4,7 +4,7 @@ This file gives Claude Code guidance for working in this repository. README.md h
 
 ## What this is
 
-A Windows tool that records WiFi CSI from an ESPectre Native board (ESP32, HTTP API on port 62587) and webcam video on one PC clock, analyzes each session once, then replays both in the browser frame by frame.
+A Windows tool that records WiFi CSI from one or more ESPectre Native boards (ESP32, HTTP API on port 62587) and webcam video on one PC clock, analyzes each session once, then replays both in the browser frame by frame.
 
 - `record.py` handles capture, session finalization, and the preview window (OpenCV). It runs the analysis at the end.
 - `analyze.py` computes every derived value once into `<session>/derived/`, with `manifest.json` deciding when to recompute.
@@ -23,9 +23,11 @@ python -m pytest tests -q                   # full suite, about 25 s, no hardwar
 python -m pytest tests/test_analyze.py -q   # one file
 python -m pytest tests -q -k replay         # by name
 python tests\make_demo_session.py sessions\demo --seconds 60 --offset-ms 80
-python analyze.py sessions\<folder> [--recompute]
+python analyze.py sessions\<folder> [--recompute]        # every board of the recording
 python player.py sessions\demo [--recompute] # http://localhost:8000
+python player.py sessions\<folder> --device <name>      # one board of several
 python record.py --target <IP> --camera 0 --duration 300 --out sessions/
+python record.py --target a=<IP1> --target b=<IP2> ...   # several boards, one folder each
 python record.py --recover sessions\<folder>
 ```
 
@@ -45,22 +47,29 @@ The README table "What comes from ESPectre" lists every function used. Keep it c
 
 ## Invariants to preserve
 
-- **Board requests are GET only, except one.** The single exception is the detector switch: the **D** key in preview sends `PATCH /sensing {"detector": ...}` via `Recorder.switch_detector()`.
+- **Session layout:**
+  - A recording folder holds the shared `video.mp4`, `frames.csv` and a recording-wide `session.json` (with `devices`). Each board has its own subfolder (`parse_target` gives its name) with `csi.npz`, `csi_meta.json`, `diagnostics.csv`, `csi_stream.bin` while recording, its own `session.json` (clock fit, `sync_offset_ms`, `player_settings`), `derived/` and `frequency_cache/`. New recordings always use subfolders, even with one board.
+  - Older single-board sessions keep everything in one folder and must keep working.
+  - `analyze.device_folders()` finds the board folders (the folder itself when it has `csi_meta.json`), and `analyze.video_folder()` / `analyze.input_path()` find the shared video files from a device folder. Never open `frames.csv` or `video.mp4` as `folder / name` in analysis or player code.
+  - Analysis, the player and every cached result work on one device folder. The frequency cache key has no t0, and t0 is per board (first frame or that board's first CSI record).
+
+- **Board requests are GET only, except one.** The single exception is the detector switch: the **D** key in preview sends `PATCH /sensing {"detector": ...}` via `Recorder.switch_detector()`, which brings every board to the detector the first board is not running (one PATCH per board that is not already on it, through `Board.switch_detector()`).
   - The switch is refused while recording.
   - A `sensing_lock` stops the 1 Hz `/sensing` refresh from overwriting a switch result.
-  - `test_recorder_end_to_end.py` asserts that a recording without D is GET only, and that D sends exactly one PATCH.
+  - `test_recorder_end_to_end.py` asserts that a recording without D is GET only, and that D sends exactly one PATCH per board that needs it.
 - **The `/csi` session:**
   - Opening `/csi` starts a session on the board, which pauses motion events.
   - Closing the connection (`receiver.stop()`) ends the session.
   - A second `/csi` client gets HTTP 409.
-  - `begin_recording()` re-reads `/sensing` so `csi_meta.json` holds the settings in force at S.
-- **Sync offset sign:** a positive `sync_offset_ms` moves CSI *later*. A CSI frame at `csi_t` lines up with the video frame at `csi_t + offset`. This holds in `timesync.py`, `player.py`, and the JS (`state.offsetS`). Cached results (frequency, ESPectre) are stored in CSI time *without* the offset, and the page adds it when drawing.
+  - `Recorder.begin_recording()` opens `/csi` on every board before creating any file; if one fails, the boards already opened are stopped again. Each attempt uses a fresh receiver (`Board.open_csi()`).
+  - `Board.open_csi()` re-reads `/sensing` so `csi_meta.json` holds the settings in force at S.
+- **Sync offset sign:** a positive `sync_offset_ms` (stored per board) moves CSI *later*. A CSI frame at `csi_t` lines up with the video frame at `csi_t + offset`. This holds in `timesync.py`, `player.py`, and the JS (`state.offsetS`). Cached results (frequency, ESPectre) are stored in CSI time *without* the offset, and the page adds it when drawing.
 - **Clocks:** video frames are stamped with `time.time_ns()` and `perf_counter_ns()` right after `camera.grab()`, before `retrieve()`. CSI times in `csi.npz` (`csi_t_ns`) are device ticks mapped to PC ns by `timesync.fit_device_to_pc`. That function runs Theil-Sen through the earliest arrival in each window, because network delay is never negative. `pc_receive_t_ns` keeps the raw arrival time.
 - **Session time zero:** session seconds count from `analyze.session_t0_ns()`, whichever of the first frame or first CSI record came first. The player and the analysis must use the same t0, because the frequency cache key does not include it.
 - **Video PTS** are integer microseconds (`VIDEO_TIME_BASE = 1/1e6`), taken from real capture times. That makes the video variable frame rate, and `frames.csv` `pts_us` matches the MP4 exactly. The player maps the browser `mediaTime` to a frame index through `frame_pts`, so never assume a constant fps.
 - **Crash safety while recording:**
-  - Data goes to an append-only `csi_stream.bin` (a 16-byte header `CSIVSYNC` + iq_bytes, then fixed-size records from `csi_record_dtype`) and a fragmented `video.part.mp4`.
-  - `finalize_session()` is shared by a clean stop and `--recover`. It builds `csi.npz`, remuxes to a faststart `video.mp4` without re-encoding, and trims `frames.csv` to the packets that survived.
+  - Each board's data goes to its own append-only `<device>/csi_stream.bin` (a 16-byte header `CSIVSYNC` + iq_bytes, then fixed-size records from `csi_record_dtype`) and a fragmented `video.part.mp4`.
+  - `finalize_session()` is shared by a clean stop and `--recover`, and takes the recording folder. It builds each board's `csi.npz` (`_finalize_csi`), writes each board's `session.json` and the recording's `devices` summary, remuxes to a faststart `video.mp4` without re-encoding, and trims `frames.csv` to the packets that survived.
   - It deletes the intermediates only after the final files exist.
   - Analysis runs after finalization. A failure there only prints a warning and never costs the recording.
   - All JSON writes are atomic.
@@ -84,20 +93,20 @@ The README table "What comes from ESPectre" lists every function used. Keep it c
 
 ## Threads in record.py
 
-`Recorder` runs these threads:
-- camera (`_camera_loop`)
-- diagnostics (a 1 Hz poll that runs in preview too, and refreshes `/sensing` there)
-- encoder (`_encoder_loop`, fed by a bounded `frame_queue`; it counts drops and never blocks capture)
-- csi (`receiver.run()`, which calls `_on_csi_packet` on the receiver thread)
-- a short-lived switch thread for D
+`Recorder` owns the camera, the encoder and one `Board` per `--target`. Everything about one board (HTTP client, receiver, CSI writer, diagnostics, detector switch, live numbers) lives in `Board`. The threads are:
+- camera (`Recorder._camera_loop`)
+- encoder (`Recorder._encoder_loop`, fed by a bounded `frame_queue`; it counts drops and never blocks capture)
+- per board, diagnostics (`Board.diagnostics_loop`, a 1 Hz poll that runs in preview too, and refreshes `/sensing` there)
+- per board, csi (`receiver.run()`, which calls `Board._on_csi_packet` on the receiver thread)
+- per board, a short-lived switch thread for D
 
-Every board request goes through `Recorder.request()`, which holds `client_lock`. The `recording` and `quit` events gate everything.
+Every board request goes through `Board.request()`, which holds that board's `client_lock`. The recorder's `recording` and `quit` events are shared by every board and gate everything.
 
-`stop_recording()` ends the run in this order: stop the receiver, put `None` on the queue as a sentinel, join the threads, finalize, then analyze. `run_recorder(args, camera_factory)` is the entry point the tests use, with `--autostart --no-window`.
+`stop_recording()` ends the run in this order: stop every board's receiver, put `None` on the queue as a sentinel, join the threads, write each board's run counters (`Board.close_files`), finalize, then analyze every board. `run_recorder(args, camera_factory)` is the entry point the tests use, with `--autostart --no-window`.
 
 ## Player data flow
 
-`load_session()` reads `csi.npz` (through ESPectre's `load_npz_arrays`) and `frames.csv`, calls `analyze.ensure_analysis()`, and loads the results with `analyze.load_results()`. It then serializes each array to raw bytes. `meta.arrays` gives the dtype of each name (`f8`, `f4`, `i1`, `i8` or `u1`), and `ARRAY_TYPES` in `app.js` maps it to a typed array.
+`resolve_device()` picks the board folder (the only one, or `--device`). `load_session()` takes that device folder, reads `csi.npz` (through ESPectre's `load_npz_arrays`) and `frames.csv`, calls `analyze.ensure_analysis()`, and loads the results with `analyze.load_results()`. It then serializes each array to raw bytes. `meta.arrays` gives the dtype of each name (`f8`, `f4`, `i1`, `i8` or `u1`), and `ARRAY_TYPES` in `app.js` maps it to a typed array.
 
 - **Fetching and lookup:** the browser fetches `/api/meta` and `/api/array/{name}`, and does all lookups client-side with a binary search. The browser needs `requestVideoFrameCallback` (Chrome or Edge) for exact frames.
 - **Lazy arrays:** the arrays in `meta.detail_arrays` are fetched only when a details view opens.
@@ -116,5 +125,5 @@ Every board request goes through `Recorder.request()`, which holds `client_lock`
   - the replay equals `replay_idle_stream`
   - the manifest and cache behavior, and that the player does not recompute
 - `test_player.py`: signal functions, the FastAPI `TestClient`, the details and ESPectre arrays, and the sync estimate on a demo session.
-- `test_recorder_end_to_end.py`: a module-scoped fixture records 6 s from `FakeBoard` (a local HTTP server that emits V8 frames in bursts with a 40 ppm drift, and accepts only a `PATCH /sensing` detector switch) and `SyntheticCamera`. It then checks every output file, the analysis, and the detector switch.
+- `test_recorder_end_to_end.py`: a module-scoped fixture records 6 s from two `FakeBoard`s at once (a local HTTP server that emits V8 frames in bursts with a 40 ppm drift, and accepts only a `PATCH /sensing` detector switch) and `SyntheticCamera`. It then checks the layout, every output file, each board's analysis, the player on one board, the detector switch, a refused start on one board, and `--recover` for both layouts.
 - `make_demo_session.py`: both a CLI and a test helper. It writes the same `csi.npz` format as a real recording.

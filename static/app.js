@@ -508,7 +508,8 @@ async function start() {
   setMode(saved.mode in MODE_PANELS ? saved.mode : "time", false);
 
   const fit = meta.summary.fit_ok ? `clock fit residual ${meta.summary.fit_residual_rms_ms.toFixed(2)} ms` : "clock fit unreliable";
-  $("infoStatus").textContent = fit;
+  $("infoStatus").textContent = meta.device ? `${meta.device} · ${fit}` : fit;
+  if (meta.device) document.title = `${meta.device} · ${document.title}`;
   if ("requestVideoFrameCallback" in HTMLVideoElement.prototype) {
     video.requestVideoFrameCallback(onVideoFrame);
   } else {

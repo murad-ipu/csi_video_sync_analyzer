@@ -3,9 +3,11 @@
     python player.py sessions/<folder>                  # opens http://localhost:8000
     python player.py sessions/<folder> --estimate-sync  # prints a suggested offset
     python player.py sessions/<folder> --recompute     # redo the saved analysis first
+    python player.py sessions/<folder> --device <name> # one board of a multi-board recording
 
-The player only loads results: analyze.py computes them once into
-<session>/derived/, and runs here only if they are missing or out of date.
+The player shows one board at a time, against the recording's shared video.
+It only loads results: analyze.py computes them once into
+<device folder>/derived/, and runs here only if they are missing or out of date.
 Everything is sent to the browser as binary arrays, so the page never waits
 for the server while you scrub or step.
 """
@@ -87,14 +89,38 @@ def _espectre_payload(detectors: dict, t0_ns: int, arrays: dict) -> dict | None:
     return summary
 
 
+def resolve_device(folder: Path, device: str | None = None) -> Path:
+    """The device folder to show: the only board of the recording, or the one named."""
+    folder = Path(folder)
+    devices = analyze.device_folders(folder)
+    names = [path.name for path in devices]
+    if device:
+        if folder / device in devices:
+            return folder / device
+        raise SystemExit(f"{folder} has no device {device!r}. Devices: {', '.join(names) or 'none'}")
+    if len(devices) == 1:
+        return devices[0]
+    if not devices:
+        return folder  # load_session reports what is missing
+    raise SystemExit(f"{folder} holds {len(devices)} devices: {', '.join(names)}. "
+                     f"Pick one with --device <name>, or pass its folder.")
+
+
 def load_session(folder: Path, repo=None, recompute: bool = False) -> dict:
-    """Load a session and its saved results (analyze.py), computing them only if needed."""
+    """Load one board's session and its saved results (analyze.py), computing them only if needed.
+
+    folder is a device folder; video.mp4 and frames.csv come from analyze.video_folder().
+    """
+    folder = Path(folder)
+    video_dir = analyze.video_folder(folder)
     missing = [name for name in ("session.json", "frames.csv", "csi.npz", "csi_meta.json", "video.mp4")
-               if not (folder / name).exists()]
+               if not analyze.input_path(folder, name).exists()]
     if missing:
         hint = ""
-        if (folder / "csi_stream.bin").exists() or (folder / "video.part.mp4").exists():
-            hint = f"\nThis session did not finish. Run: python record.py --recover {folder}"
+        unfinished = [video_dir / "video.part.mp4", folder / "csi_stream.bin"]
+        unfinished += [path / "csi_stream.bin" for path in analyze.device_folders(video_dir)]
+        if any(path.exists() for path in unfinished):
+            hint = f"\nThis session did not finish. Run: python record.py --recover {video_dir}"
         raise SystemExit(f"{folder} is missing: {', '.join(missing)}{hint}")
 
     espectre_path.setup(repo)
@@ -174,6 +200,8 @@ def load_session(folder: Path, repo=None, recompute: bool = False) -> dict:
         "presence": presence["info"] if presence is not None else None,
         "sync_offset_ms": float(session.get("sync_offset_ms", 0)),
         "player_settings": session.get("player_settings", {}),
+        # The board's name when the recording has its own folder for each board.
+        "device": folder.name if video_dir != folder else None,
         "summary": {
             "status": session.get("status"),
             "fit_residual_rms_ms": session.get("time_fit", {}).get("residual_rms_ms"),
@@ -182,14 +210,14 @@ def load_session(folder: Path, repo=None, recompute: bool = False) -> dict:
         "arrays": {name: dtype for name, (dtype, _) in arrays.items()},
     }
     return {
-        "folder": folder, "meta": meta, "payloads": payloads, "frame_t_s": frame_t_s,
+        "folder": folder, "video_path": video_dir / "video.mp4", "meta": meta, "payloads": payloads, "frame_t_s": frame_t_s,
         "csi_t_s": csi_t_s, "normalized": normalized, "presence": presence,
     }
 
 
 def estimate_sync(data: dict) -> dict:
     """Compare video motion energy with a short-window CSI motion signal."""
-    energy = video_motion_energy(data["folder"] / "video.mp4")
+    energy = video_motion_energy(data["video_path"])
     frame_t = data["frame_t_s"]
     # A difference between two frames describes the moment halfway between them.
     midpoints = (frame_t[1:] + frame_t[:-1])[: energy.size] / 2
@@ -266,7 +294,7 @@ def create_app(data: dict) -> FastAPI:
     @app.get("/video.mp4")
     def get_video():
         # FileResponse answers HTTP Range requests, which browsers need for seeking.
-        return FileResponse(folder / "video.mp4", media_type="video/mp4")
+        return FileResponse(data["video_path"], media_type="video/mp4")
 
     @app.post("/api/sync_offset")
     def set_sync_offset(body: SyncOffset):
@@ -371,7 +399,8 @@ def print_estimate(result: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Replay a CSI + video session in the browser.")
-    parser.add_argument("session", help="Session folder made by record.py")
+    parser.add_argument("session", help="Session folder made by record.py, or one device folder inside it")
+    parser.add_argument("--device", help="Which board to show, for a recording with several")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--no-browser", action="store_true", help="Do not open a browser tab")
     parser.add_argument("--estimate-sync", action="store_true", help="Print a suggested sync offset and exit")
@@ -380,7 +409,10 @@ def main() -> None:
     args = parser.parse_args()
 
     print("Loading session...")
-    data = load_session(Path(args.session), args.repo, args.recompute)
+    folder = resolve_device(Path(args.session), args.device)
+    if folder != Path(args.session):
+        print(f"Device: {folder.name}")
+    data = load_session(folder, args.repo, args.recompute)
 
     if args.estimate_sync:
         print("Decoding video to measure motion energy...")

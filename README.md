@@ -1,6 +1,6 @@
 # CSI + video sync
 
-Record WiFi CSI from an ESPectre Native board and webcam video on one PC clock, then replay them together in the browser, frame by frame.
+Record WiFi CSI from one or more ESPectre Native boards and webcam video on one PC clock, then replay them together in the browser, frame by frame.
 
 It only sends GET requests to the board, so settings and the traffic source never change. The one exception is the **D** key in the preview window, which switches the board's detector before you start (see [Record](#record)). While recording, the board pauses its motion events, and it resumes sensing when the recording stops.
 
@@ -23,11 +23,28 @@ python -m pip install -r requirements.txt
 python record.py --target <BOARD_IP> --camera 0 --duration 300 --out sessions/
 ```
 
+### Several boards at once
+
+Repeat `--target` (or separate addresses with commas) to record several boards with the same camera. Each board gets its own folder in the session, named `NAME` from `NAME=IP`, or after the address when no name is given:
+
+```powershell
+python record.py --target kitchen=192.168.1.10 --target hall=192.168.1.11 --camera 0 --out sessions/
+```
+
+```
+sessions\20261124_101500\
+  video.mp4  frames.csv  session.json   shared video, and a summary of the whole recording
+  kitchen\  csi.npz  csi_meta.json  diagnostics.csv  session.json  derived\
+  hall\     csi.npz  csi_meta.json  diagnostics.csv  session.json  derived\
+```
+
+Each board's CSI is timed by its own clock fit, so each board has its own `session.json` with its clock fit, sync offset and player settings. Every board's `/csi` is opened before anything is written: if one board refuses (for example HTTP 409), the others are released again and no folder is created. If a board's stream fails during the recording, the recording stops and every file is still finished. Even with one `--target`, the board's files go in their own folder.
+
 In the preview window, press **S** to start and **Q** to stop. `--duration` counts from S. Other options: `--width`, `--height`, `--fps`, `--autostart`.
 
-The status box shows elapsed time, CSI frames per second, occupancy, video fps, and drops. During recording, occupancy is computed on the PC, because the board's own `csi_occupancy` reads 0 during a `/csi` session.
+The status box shows elapsed time, video fps, and drops, then one line per board with its CSI frames per second, occupancy, and drops. During recording, occupancy is computed on the PC, because the board's own `csi_occupancy` reads 0 during a `/csi` session.
 
-Before recording, the status box also shows the board's motion detector (`lightweight` or `high_accuracy`), its threshold, the motion on/off hit counts, and whether it is ready or calibrating. Press **D** to switch the detector. This sends one `PATCH /sensing` request; it is the only request the recorder sends that is not a GET. D works only before S: during a recording the board refuses setting changes, and it runs no detector anyway. After a switch to Lightweight the board recalibrates, so keep the room quiet for about 10 s. The settings in force when you press S are saved in `csi_meta.json`.
+Before recording, the status box also shows each board's motion detector (`lightweight` or `high_accuracy`), its threshold, the motion on/off hit counts, and whether it is ready or calibrating. Press **D** to switch the detector: every board is set to the detector the first board is not running, so they all match. This sends one `PATCH /sensing` request to each board that is not already on that detector; it is the only request the recorder sends that is not a GET. D works only before S: during a recording the board refuses setting changes, and it runs no detector anyway. After a switch to Lightweight the board recalibrates, so keep the room quiet for about 10 s. The settings in force when you press S are saved in `csi_meta.json`.
 
 When the recording stops, the session is analyzed automatically (a few seconds for 5 minutes, see [Analyze](#analyze)).
 
@@ -40,11 +57,12 @@ python record.py --recover sessions\<folder>
 ## Analyze
 
 ```powershell
-python analyze.py sessions\<folder>              # only computes what is missing or out of date
+python analyze.py sessions\<folder>              # every board; only computes what is missing or out of date
+python analyze.py sessions\<folder>\<device>     # one board
 python analyze.py sessions\<folder> --recompute  # always recompute
 ```
 
-This computes everything the player shows, once, and saves it in the session's `derived` folder:
+This computes everything the player shows, once for each board, and saves it in that board folder's `derived` folder:
 
 - **Amplitude and phase** of every subcarrier, from ESPectre's `CSIPacket`. New recordings already store them in `csi.npz`. For older recordings they are saved in `derived\csi_values.npz`; `csi.npz` is never changed.
 - **The player's signals**: which subcarriers carry signal, per-frame normalized amplitude, the 0.5 s motion signal, and each frame's mean amplitude.
@@ -58,10 +76,12 @@ You rarely need to run it yourself: `record.py` runs it after every recording, a
 ## Replay
 
 ```powershell
-python player.py sessions\<folder>
+python player.py sessions\<folder>                    # a recording with one board
+python player.py sessions\<folder> --device kitchen   # one board of several
+python player.py sessions\<folder>\kitchen            # the same
 ```
 
-This opens http://localhost:8000 (use `--port` to change it). Chrome or Edge is recommended. Add `--recompute` to redo the saved analysis first.
+The player shows one board at a time against the shared video; the board's name is shown in the footer and the tab title. To compare boards side by side, run a second player with `--port 8001`. This opens http://localhost:8000 (use `--port` to change it). Chrome or Edge is recommended. Add `--recompute` to redo the saved analysis first.
 
 | Key | Action |
 | --- | --- |
@@ -69,7 +89,7 @@ This opens http://localhost:8000 (use `--port` to change it). Chrome or Edge is 
 | Left / Right | Step one video frame |
 | Shift+Left / Shift+Right | Step one CSI frame |
 
-Use the timeline to jump anywhere. Offset changes save to `session.json` automatically.
+Use the timeline to jump anywhere. Offset changes save to the board's `session.json` automatically, so each board keeps its own offset.
 
 ## ESPectre detectors
 
@@ -194,16 +214,19 @@ python player.py sessions\<folder> --estimate-sync
 
 ## Session files
 
+The recording folder holds the files shared by every board; each board's folder holds the rest. Sessions recorded before multi-board support keep everything in one folder, and every tool still reads them.
+
 | File | Contents |
 | --- | --- |
-| `video.mp4` | H.264 video with real, variable frame times |
-| `frames.csv` | `frame_index`, `pc_t_ns`, `perf_t_ns`, `pts_us` |
-| `csi.npz` | `pc_receive_t_ns`, corrected `csi_t_ns`, `device_ticks_us`, sequence fields, `rssi_dbm`, `csi_data` (raw int8 pairs, Q then I), `amplitude` and `phase` (from ESPectre's `CSIPacket`), and `csi_target_pps`. Recordings made before this version have no `phase` or `csi_target_pps` |
-| `csi_meta.json` | Subcarrier count, record version, and `/device`, `/capabilities`, `/sensing` (including the detector settings), `/wifi` read when S is pressed |
-| `diagnostics.csv` | `/diagnostics` once per second. A field the firmware does not report stays empty |
-| `session.json` | Times, counts, rates, camera settings, clock fit, `sync_offset_ms`, and `player_settings` (the player's view, CSI details checkbox, frequency settings, and the Presence view's empty baseline) |
-| `derived\` | Results of `analyze.py`, with `manifest.json`. Safe to delete |
-| `frequency_cache\` | Results saved by the player's frequency mode. Safe to delete |
+| `video.mp4` | Recording folder. H.264 video with real, variable frame times |
+| `frames.csv` | Recording folder. `frame_index`, `pc_t_ns`, `perf_t_ns`, `pts_us` |
+| `session.json` (recording) | Times, stop reason, video counts and camera settings, and `devices`: each board's address, CSI counts and clock fit |
+| `<device>\csi.npz` | `pc_receive_t_ns`, corrected `csi_t_ns`, `device_ticks_us`, sequence fields, `rssi_dbm`, `csi_data` (raw int8 pairs, Q then I), `amplitude` and `phase` (from ESPectre's `CSIPacket`), and `csi_target_pps`. Recordings made before this version have no `phase` or `csi_target_pps` |
+| `<device>\csi_meta.json` | Subcarrier count, record version, and `/device`, `/capabilities`, `/sensing` (including the detector settings), `/wifi` read when S is pressed |
+| `<device>\diagnostics.csv` | The board's `/diagnostics` once per second. A field the firmware does not report stays empty |
+| `<device>\session.json` | The board's name and address, times, CSI counts and rates, clock fit, `sync_offset_ms`, and `player_settings` (the player's view, CSI details checkbox, frequency settings, and the Presence view's empty baseline) |
+| `<device>\derived\` | Results of `analyze.py`, with `manifest.json`. Safe to delete |
+| `<device>\frequency_cache\` | Results saved by the player's frequency mode. Safe to delete |
 
 ## What comes from ESPectre, and what is this app's own
 

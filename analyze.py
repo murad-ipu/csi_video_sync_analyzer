@@ -1,7 +1,12 @@
-"""Compute every derived value of a session once and save it in <session>/derived/.
+"""Compute every derived value of a session once and save it in <device folder>/derived/.
 
-    python analyze.py sessions/<folder>              # skips work that is already up to date
+    python analyze.py sessions/<folder>              # every board; skips work that is already up to date
+    python analyze.py sessions/<folder>/<device>     # one board
     python analyze.py sessions/<folder> --recompute  # always recompute
+
+Each board of a recording has its own folder (csi.npz, csi_meta.json,
+session.json) and is analyzed on its own against the shared video.mp4 and
+frames.csv one level up. Older single-board sessions keep everything in one folder.
 
 record.py runs this at the end of every recording, and player.py runs it when
 the saved results are missing or out of date. The player itself only loads.
@@ -41,6 +46,7 @@ import frequency
 DERIVED_DIR = "derived"
 MANIFEST = "manifest.json"
 INPUT_FILES = ("csi.npz", "frames.csv", "csi_meta.json")
+VIDEO_FILES = ("frames.csv", "video.mp4")  # shared by every board, in the recording folder
 # Hashing these means any change to the analysis code invalidates old results.
 CODE_FILES = ("analyze.py", "espectre_bridge.py", "frequency.py")
 ROOT = Path(__file__).resolve().parent
@@ -78,8 +84,36 @@ def _write_json(path: Path, data: dict) -> None:
     os.replace(temp, path)
 
 
+def device_folders(folder: Path) -> list[Path]:
+    """The folders that each hold one board's CSI (csi_meta.json, csi.npz, its own session.json).
+
+    A recording keeps each board in its own subfolder next to the shared video.
+    Single-board recordings from older versions keep the CSI beside the video,
+    so the folder itself is returned for them.
+    """
+    folder = Path(folder)
+    if (folder / "csi_meta.json").exists():
+        return [folder]
+    if not folder.is_dir():
+        return []
+    return sorted(path for path in folder.iterdir() if path.is_dir() and (path / "csi_meta.json").exists())
+
+
+def video_folder(folder: Path) -> Path:
+    """Where video.mp4 and frames.csv are: the folder itself, or the recording folder above a device folder."""
+    folder = Path(folder)
+    if not (folder / "frames.csv").exists() and (folder.parent / "frames.csv").exists():
+        return folder.parent
+    return folder
+
+
+def input_path(folder: Path, name: str) -> Path:
+    """An input file of a device folder; the video's files are shared by every board of a recording."""
+    return (video_folder(folder) if name in VIDEO_FILES else Path(folder)) / name
+
+
 def read_frames(folder: Path) -> np.ndarray:
-    return np.loadtxt(folder / "frames.csv", delimiter=",", skiprows=1, dtype=np.int64, ndmin=2)
+    return np.loadtxt(input_path(folder, "frames.csv"), delimiter=",", skiprows=1, dtype=np.int64, ndmin=2)
 
 
 def session_t0_ns(frame_t_ns: np.ndarray, csi_t_ns: np.ndarray) -> int:
@@ -114,7 +148,7 @@ def fingerprint(folder: Path, repo=None) -> dict:
     for name in CODE_FILES:
         code.update((ROOT / name).read_bytes())
     return {
-        "inputs": {name: _sha256(folder / name) for name in INPUT_FILES},
+        "inputs": {name: _sha256(input_path(folder, name)) for name in INPUT_FILES},
         "code_sha256": code.hexdigest(),
         "espectre": {
             "commit": commit.strip() if commit else "unknown",
@@ -297,9 +331,9 @@ def load_results(folder: Path, csi) -> dict:
             "presence": presence}
 
 
-def print_summary(manifest: dict) -> None:
+def print_summary(manifest: dict, device: str = "") -> None:
     timings = manifest["timings"]
-    print(f"Analysis done in {timings['total_s']:.1f} s (ESPectre detectors {timings['detectors_s']:.1f} s).")
+    print(f"{device + ': ' if device else ''}Analysis done in {timings['total_s']:.1f} s (ESPectre detectors {timings['detectors_s']:.1f} s).")
     for name, info in manifest["detectors"].items():
         ready = max(1, info["n_ready"])
         print(f"  {name:14s} threshold {info['start_threshold']:.3f} ({info['threshold_source']}), "
@@ -308,19 +342,23 @@ def print_summary(manifest: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compute and save the derived results of a session.")
-    parser.add_argument("session", help="Session folder made by record.py")
+    parser.add_argument("session", help="Session folder made by record.py, or one device folder inside it")
     parser.add_argument("--recompute", action="store_true", help="Recompute even if the saved results are up to date")
     parser.add_argument("--repo", help="Path to the ESPectre clone (default ../espectre)")
     args = parser.parse_args()
-    folder = Path(args.session)
-    missing = [name for name in INPUT_FILES if not (folder / name).exists()]
-    if missing:
-        raise SystemExit(f"{folder} is missing: {', '.join(missing)}. Finish it with: python record.py --recover {folder}")
-    manifest, computed = ensure_analysis(folder, args.repo, args.recompute)
-    if computed:
-        print_summary(manifest)
-    else:
-        print(f"{folder}: results are up to date (use --recompute to redo them).")
+    folders = device_folders(Path(args.session))
+    if not folders:
+        raise SystemExit(f"{args.session} holds no recording (no csi_meta.json in it or in a device folder).")
+    for folder in folders:  # every board of a recording, one after another
+        missing = [name for name in INPUT_FILES if not input_path(folder, name).exists()]
+        if missing:
+            raise SystemExit(f"{folder} is missing: {', '.join(missing)}. "
+                             f"Finish it with: python record.py --recover {video_folder(folder)}")
+        manifest, computed = ensure_analysis(folder, args.repo, args.recompute)
+        if computed:
+            print_summary(manifest, folder.name if folder != Path(args.session) else "")
+        else:
+            print(f"{folder}: results are up to date (use --recompute to redo them).")
 
 
 if __name__ == "__main__":
