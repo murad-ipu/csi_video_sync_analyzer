@@ -40,6 +40,12 @@ sessions\20261124_101500\
 
 Each board's CSI is timed by its own clock fit, so each board has its own `session.json` with its clock fit, sync offset and player settings. Every board's `/csi` is opened before anything is written: if one board refuses (for example HTTP 409), the others are released again and no folder is created. If a board's stream fails during the recording, the recording stops and every file is still finished. Even with one `--target`, the board's files go in their own folder.
 
+Each recording goes in a new folder inside `--out`, named after the start date and time. Use `--name` to choose the folder name instead; the recorder refuses a name that already exists, so nothing is overwritten:
+
+```powershell
+python record.py --target <BOARD_IP> --out sessions --name exp1   # records into sessions\exp1
+```
+
 In the preview window, press **S** to start and **Q** to stop. `--duration` counts from S. Other options: `--width`, `--height`, `--fps`, `--autostart`.
 
 The status box shows elapsed time, video fps, and drops, then one line per board with its CSI frames per second, occupancy, and drops. During recording, occupancy is computed on the PC, because the board's own `csi_occupancy` reads 0 during a `/csi` session.

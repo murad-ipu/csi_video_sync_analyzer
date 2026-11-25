@@ -308,6 +308,21 @@ def test_second_session_gets_a_clear_error_when_board_is_busy(tmp_path):
         assert list(tmp_path.iterdir()) == [], "no session folder for a refused start"
 
 
+def test_session_folder_name_can_be_chosen(tmp_path):
+    with FakeBoard() as board:
+        args = recorder_args(board, tmp_path)
+        args.name, args.duration = "exp1", 1.0
+        folder, _ = record.run_recorder(args, camera_factory)
+        assert Path(folder) == tmp_path / "exp1"
+        assert (tmp_path / "exp1" / "video.mp4").exists()
+        assert (tmp_path / "exp1" / f"127.0.0.1_{board.port}" / "csi.npz").exists()
+    # An existing folder is never reused, and bad names are refused.
+    for name in ("exp1", "..\\up", "a/b", "x:"):
+        with pytest.raises(SystemExit):
+            record.parse_args(["--target", "10.0.0.1", "--out", str(tmp_path), "--name", name])
+    assert record.parse_args(["--target", "10.0.0.1", "--out", str(tmp_path), "--name", "exp 2"]).name == "exp 2"
+
+
 def test_one_busy_board_releases_the_others_and_creates_nothing(tmp_path):
     with FakeBoard() as free, FakeBoard() as busy:
         busy.csi_open = True

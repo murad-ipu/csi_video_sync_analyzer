@@ -856,6 +856,8 @@ class Recorder:
     def begin_recording(self) -> None:
         if self.switching():
             raise RuntimeError("a board is still switching detector; try again in a moment")
+        if self.args.name and (Path(self.args.out) / self.args.name).exists():
+            raise RuntimeError(f"{Path(self.args.out) / self.args.name} already exists; choose another --name")
         # Open /csi on every board first: if one refuses, nothing has been created on disk
         # and the boards already opened are released again.
         opened = []
@@ -871,7 +873,7 @@ class Recorder:
         args = self.args
         now = datetime.now()
         start_t_ns = time.time_ns()
-        self.session_dir = Path(args.out) / now.strftime("%Y%m%d_%H%M%S")
+        self.session_dir = Path(args.out) / (args.name or now.strftime("%Y%m%d_%H%M%S"))
         self.session_dir.mkdir(parents=True, exist_ok=False)
         base = {"status": "recording", "start_time": now.isoformat(timespec="milliseconds"), "start_t_ns": start_t_ns}
         write_json_atomic(self.session_dir / "session.json", {
@@ -1056,6 +1058,7 @@ def parse_args(argv=None):
     parser.add_argument("--camera", type=int, default=0, help="Camera index (default 0)")
     parser.add_argument("--duration", type=float, default=0, help="Stop after this many seconds (0 = until Q)")
     parser.add_argument("--out", default="sessions", help="Parent folder for sessions")
+    parser.add_argument("--name", help="Session folder name inside --out, e.g. exp1 (default: the start date and time)")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--fps", type=float, default=30.0)
@@ -1077,6 +1080,13 @@ def parse_args(argv=None):
             parser.error(f"two boards would share a folder name: {', '.join(names)}. Name them with NAME=IP")
         if len(set(targets)) != len(targets):
             parser.error("the same board address is given twice")
+    if args.name is not None:
+        args.name = args.name.strip()
+        # One plain folder name: no path separators, and nothing Windows refuses in a folder name.
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]*", args.name) or args.name.endswith((".", " ")):
+            parser.error("--name must be a folder name of letters, digits, spaces, '.', '_' or '-'")
+        if not args.recover and (Path(args.out) / args.name).exists():
+            parser.error(f"{Path(args.out) / args.name} already exists; choose another --name")
     if args.no_window and not (args.autostart and args.duration):
         parser.error("--no-window needs --autostart and --duration, otherwise nothing could stop it")
     return args

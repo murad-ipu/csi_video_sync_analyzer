@@ -28,6 +28,7 @@ python player.py sessions\demo [--recompute] # http://localhost:8000
 python player.py sessions\<folder> --device <name>      # one board of several
 python record.py --target <IP> --camera 0 --duration 300 --out sessions/
 python record.py --target a=<IP1> --target b=<IP2> ...   # several boards, one folder each
+python record.py --target <IP> --out sessions --name exp1  # sessions\exp1 instead of a date-time folder
 python record.py --recover sessions\<folder>
 ```
 
